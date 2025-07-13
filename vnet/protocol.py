@@ -233,6 +233,8 @@ class TunneledClient(IClient):
             pkt.encryption_key = self.encryption_key
             pkt.src_ip = self.ip
             self.sock.sendall(pkt.to_bytes())
+        else:
+            self.logger.warning("TunneledClient.send called before encryption completed")
 
     def recv(self) -> Packet | None:
         if self.encryption_completed and self.sock is not None:

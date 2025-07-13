@@ -11,7 +11,7 @@ class CoolServer(DoSP):
         elif pkt.type == MSG:
             super().handle_packet(pkt, sock, ip)
         else:
-            self.stop()
+            print("[UNKNOWN] data:", pkt, "from", int_to_ip(ip))
 
 if __name__ == "__main__":
     server = CoolServer()

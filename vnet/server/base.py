@@ -24,11 +24,14 @@ class DoSP:
         self.host = host
         self.port = port
         self.ip_template = ip_template
+
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.clients: dict[int, RemoteClient] = {}  # ip_int -> ServerClient
         self.lock = threading.Lock()
         self.assigned_ids = set()
+
         self.allow_local = allow_local
+        self.server_ip = ip_to_int(self.ip_template.replace("{x}", "1"))
         self.config = {
             "host": self.host,
             "port": self.port,
@@ -62,9 +65,29 @@ class DoSP:
 
     def stop(self):
         """sends a close packet to all clients and stops the server"""
+        for client in self.clients.values():
+            client.send(Packet(EXIT, b""))
         self.sock.close()
+        self.running = False
 
     def handle_client(self, sock: socket.socket):
+        """
+        Handles a single client connection.
+
+        This function is run in a separate thread for each client connection.
+        It assigns a virtual IP address to the client and sends it to the client.
+        Then it enters a loop where it receives packets from the client and
+        calls `handle_packet` to process them.
+
+        If the client forcibly closes the connection, a `ConnectionResetError`
+        is raised and caught. The client's virtual IP address is then removed
+        from the server's internal state.
+
+        If any other exception is raised, it is caught and logged, and the
+        client's virtual IP address is removed from the server's internal state.
+
+        :param sock: The socket object of the client connection.
+        """
         ip_int, ip_id = self._next_ip()
         with self.lock:
             self.clients[ip_int] = RemoteClient(sock, ip_int, self.logger)
@@ -108,8 +131,6 @@ class DoSP:
         with self.lock:
             self.clients[int_ip] = RemoteClient(client, int_ip, self.logger)
 
-
-
     def on_disconnect(self, ip_int: int):
         print(f"[vnet] Client disconnected: {int_to_ip(ip_int)}")
 
@@ -126,7 +147,7 @@ class DoSP:
                 dst_sock = self.clients.get(dst_ip)
             if dst_sock:
                 try:
-                    dst_sock.sock.sendall(Packet(R4C, pkt.payload).to_bytes())
+                    dst_sock.sock.sendall(Packet(R4C, pkt.payload, src_ip=ip_int).to_bytes())
                 except Exception as e:
                     print(f"[vnet] Failed to route to {int_to_ip(dst_ip)}: {e}")
             else:
@@ -135,7 +156,7 @@ class DoSP:
             done, msg = self.on_function(pkt.payload.decode(), ip_int)
             if not done:
                 print(f"[vnet] Function {pkt.payload.decode()} from {int_to_ip(ip_int)} failed: {msg}")
-                sock.sendall(Packet(ERR, msg.encode()).to_bytes())
+                sock.sendall(Packet(ERR, msg.encode(), src_ip=self.server_ip).to_bytes())
         elif pkt.type == GCL:
             print(f"[LOG]{int_to_ip(ip_int)}] Getting clients list")
             with self.lock:

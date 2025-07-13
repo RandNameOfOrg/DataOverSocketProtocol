@@ -17,7 +17,7 @@ class Client:
 
         self.logger.level = logging.INFO
 
-    def do_handshake(self, vip = None, cancel_on_RQIP = False):
+    def do_handshake(self, vip = None, cancel_on_RQIP_err = False):
         """Receive vIP and vnet config and request if needed"""
         pkt = Packet.from_socket(self.sock)
         print(pkt)
@@ -47,7 +47,7 @@ class Client:
         except HandshakeError as e:
             self.logger.error(e)
             self.sock.close()
-            if cancel_on_RQIP:
+            if cancel_on_RQIP_err:
                 self.logger.warning("Handshake failed, exiting...")
                 exit(-1)
             return
@@ -65,11 +65,11 @@ class Client:
 
         # Wait for 2nd key part
         pkt = Packet.from_socket(self.sock, raise_on_error=True)
-        print(pkt)
+        print(pkt, "Second key part")
         if pkt.type not in encryptedTypes and pkt.payload[0] != HC2C:
             raise HandshakeError("failed to start c2c handshake")
         key2 = pkt.payload[1:]
-        self.tunnels[c2c_vip] = TunneledClient(c2c_vip, logger=self.logger, encryption_key=key + key2)
+        self.tunnels[c2c_vip] = TunneledClient(c2c_vip, logger=self.logger, encryption_key=key + key2, sock=self.sock)
         self.logger.info(f"[vnet] Client to client connection started with {int_to_ip(c2c_vip)}")
 
     def __enter__(self):
@@ -79,6 +79,7 @@ class Client:
         self.sock.close()
 
     def send(self, pkt: Packet, on_error = None):
+        pkt.src_ip = self.vip_int
         if pkt.dst_ip in self.tunnels:
             self.tunnels[pkt.dst_ip].send(pkt)
             return
@@ -91,39 +92,49 @@ class Client:
             elif on_error == "ignore":
                 return
 
-    def receive(self, on_error = None) -> Packet | None:
+    def receive(self, on_error=None) -> Packet | None:
         try:
             pkt = Packet.from_socket(self.sock)
             if pkt is None:
                 return None
+
+            print(f"Received raw packet: {pkt}")  # Debug print
+
+            # Check if this is a handshake initiation from another client
+            if pkt.type in encryptedTypes and len(pkt.payload) > 0 and pkt.payload[0] == HC2C:
+                print("Detected HC2C handshake initiation")
+                if pkt.src_ip not in self.tunnels:
+                    key2 = os.urandom(16)
+                    response_pkt = Packet(S2C, bytes([HC2C]) + key2, dst_ip=pkt.src_ip)
+                    self.sock.sendall(response_pkt.to_bytes())
+
+                    key = pkt.payload[1:]
+                    tunnel = TunneledClient(pkt.src_ip, logger=self.logger, encryption_key=key + key2, sock=self.sock)
+                    self.tunnels[pkt.src_ip] = tunnel
+                    print(f"Created new tunnel with {int_to_ip(pkt.src_ip)}")
+
+            # If packet is from an established tunnel, decrypt it
             tunnel = self.tunnels.get(pkt.src_ip, None)
-            print(pkt)
-            print(tunnel)
+            print(f"Tunnel for {int_to_ip(pkt.src_ip)}: {tunnel}")  # Debug print
 
-            if pkt.type in encryptedTypes and HC2C in pkt.payload and tunnel is None: # start tunnel handshake with client
-                key2 = os.urandom(16)
-                pkt = Packet(S2C, bytes(HC2C) + key2, dst_ip=pkt.src_ip)
-                self.sock.sendall(pkt.to_bytes())
+            if tunnel is not None and pkt.type in encryptedTypes:
+                try:
+                    decrypted_pkt = tunnel.decrypt(pkt)
+                    print(f"Decrypted packet: {decrypted_pkt}")  # Debug print
+                    return decrypted_pkt
+                except Exception as e:
+                    self.logger.error(f"Decryption failed: {e}")
+                    return None
 
-                key = pkt.payload[1:]
-                tunnel = TunneledClient(pkt.src_ip, logger=self.logger, encryption_key=key + key2)
-                self.tunnels[pkt.src_ip] = tunnel
-            elif pkt.type in encryptedTypes and tunnel is not None:
-                # decrypt
-                pkt = tunnel.decrypt(pkt)
-                print(pkt)
-                pkt2 = Packet(pkt.type, pkt.payload, src_ip=self.vip_int, dst_ip=pkt.src_ip, encryption_key=tunnel.encryption_key)
-                print(pkt2)
+            return pkt
 
         except Exception as e:
             self.logger.error(f"[vnet] Error receiving packet: {e}")
             if on_error is None:
                 raise PacketError("failed to receive packet: " + str(e))
-            elif on_error == "ignore": pass
+            elif on_error == "ignore":
+                pass
             return None
-        self.logger.debug("[vnet] Received packet: " + str(pkt))
-        return pkt
-
 
 # class LocalClient(Client):
 #     """Client connected through another python process"""
