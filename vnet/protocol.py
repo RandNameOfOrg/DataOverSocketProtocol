@@ -22,16 +22,26 @@ SA   = 0x10  # Server answer
 EXIT = 0x11  # Exit
 ERR  = 0x12  # Error
 AIP  = 0x13  # Assign IP
-HSK =  0x14  # Handshake
+HSK  = 0x14  # Handshake
+HC2C = 0x15  # Handshake to client prefix
 
-packetTypesToNames = {
+packetTypes = {
     MSG: "MSG",   PING: "PING",
     S2C: "S2C",   GCL: "GCL",
     FN: "FN",     SD: "SD",
     RQIP: "RQIP", R4C: "R4C",
     SA: "SA",
     EXIT: "EXIT", ERR: "ERR",
-    AIP: "AIP",   HSK: "HSK"
+    AIP: "AIP",   HSK: "HSK",
+    HC2C: "HC2C"
+}
+_ = {}
+for k, v in packetTypes.items():
+    _[v] = k
+packetTypes = packetTypes | _
+
+encryptedTypes = {
+    S2C, R4C
 }
 
 class ERR_CODES:
@@ -60,19 +70,29 @@ class ERR_CODES:
     def __getitem__(self, key):
         return self.code_to_error[key]
 
-packetTypes = {
-    "MSG": MSG,   "PING": PING,
-    "S2C": S2C,   "GCL":  GCL,
-    "FN": FN,     "SD": SD,
-    "RQIP": RQIP, "R4C": R4C,
-    "SA": SA,
-    "EXIT": EXIT, "ERR": ERR,
-    "AIP": AIP,   "HSK": HSK
-}
+# packetTypes = {
+#     "MSG": MSG,   "PING": PING,
+#     "S2C": S2C,   "GCL":  GCL,
+#     "FN": FN,     "SD": SD,
+#     "RQIP": RQIP, "R4C": R4C,
+#     "SA": SA,
+#     "EXIT": EXIT, "ERR": ERR,
+#     "AIP": AIP,   "HSK": HSK,
+#     "HC2C": HC2C
+# }
 # endregion
 
 GCM_NONCE_SIZE = 12 # For encryption
 
+
+def recv_exact(sock, size: int) -> bytes | None:
+    buf = b''
+    while len(buf) < size:
+        part = sock.recv(size - len(buf))
+        if not part:
+            return None
+        buf += part
+    return buf
 
 def encrypt(data: bytes, key: bytes) -> bytes:
     """Encrypts data using AES-GCM.
@@ -90,7 +110,6 @@ def encrypt(data: bytes, key: bytes) -> bytes:
     # Формат: nonce (12) + ciphertext + tag (16)
     return nonce + ciphertext + tag
 
-
 def decrypt(data: bytes, key: bytes) -> bytes:
     """Decrypts data using AES-GCM.
     :return: data (bytes)"""
@@ -107,11 +126,12 @@ def decrypt(data: bytes, key: bytes) -> bytes:
     return cipher.decrypt_and_verify(ciphertext, tag)
 
 class Packet:
-    def __init__(self, type_: int, payload: bytes, dst_ip: int = None, encryption_key = None):
+    def __init__(self, type_: int, payload: bytes, dst_ip: int = None, src_ip: int = None, encryption_key = None):
         globals().update(packetTypes)
         self.type    = type_
         self.payload = payload
         self.dst_ip  = dst_ip
+        self.src_ip  = src_ip
         self.encryption_key = encryption_key
 
     def to_bytes(self) -> bytes:
@@ -127,30 +147,41 @@ class Packet:
             return struct.pack(">BI", self.type, len(self.payload)) + self.payload
 
     @staticmethod
-    def from_socket(sock, raise_on_error: bool = False, encryption_key = None) -> 'Packet | None':
+    def from_socket(sock, src_ip: int = None, raise_on_error: bool = False, encryption_key=None) -> 'Packet | None':
         header = recv_exact(sock, 5)
         if not header:
             if raise_on_error:
                 raise VNetException("failed to receive packet header")
             return None
+
         type_, length = struct.unpack(">BI", header)
         data = recv_exact(sock, length)
         if data is None:
             if raise_on_error:
                 raise VNetException("failed to receive packet data")
             return None
+
+        if encryption_key and type_ in encryptedTypes:
+            try:
+                data = decrypt(data, encryption_key)
+            except ValueError as e:
+                if raise_on_error:
+                    raise PacketError(f"Decryption failed: {e}")
+                return None
+
         if type_ == S2C:
             if len(data) < 4:
                 if raise_on_error:
-                    raise VNetException("failed to receive packet data")
+                    raise VNetException("invalid S2C packet (missing dst_ip)")
                 return None
             dst_ip = struct.unpack(">I", data[:4])[0]
             payload = data[4:]
-            return Packet(type_, payload, dst_ip=dst_ip)
-        return Packet(type_, data)
+            return Packet(type_, payload, dst_ip=dst_ip, src_ip=src_ip)
+
+        return Packet(type_, data, src_ip=src_ip)
 
     def __str__(self) -> str:
-        base = f"type={packetTypesToNames[self.type]}, payload={self.payload}"
+        base = f"type={packetTypes[self.type]}, payload={self.payload}"
         if self.dst_ip is None:
             return f"Packet({base})"
         return f"Packet({base}, dst_ip={int_to_ip(self.dst_ip)})"
@@ -164,13 +195,22 @@ class IClient(ABC):
         raise NotImplementedError
 
 class RemoteClient(IClient):
-    def __init__(self, sock: socket.socket | None, ip: int, logger: logging.Logger, allow_local = False) -> None:
+    def __init__(self, sock: socket.socket | None,
+                 ip: int, logger: logging.Logger,
+                 allow_local = False,
+                 encryption_key = None) -> None:
         if not allow_local and sock is None:
             raise HandshakeError("local connection not allowed")
 
         self.sock = sock
         self.ip = ip
         self.logger = logger
+
+        self.encryption_key = encryption_key
+        if self.encryption_key is not None:
+            self.encryption_completed = len(self.encryption_key) == 32
+        else:
+            self.encryption_completed = False
 
     def send(self, pkt: Packet) -> None:
         if self.sock is not None:
@@ -179,14 +219,32 @@ class RemoteClient(IClient):
     def recv(self) -> Packet | None:
         return Packet.from_socket(self.sock)
 
-def recv_exact(sock, size: int) -> bytes | None:
-    buf = b''
-    while len(buf) < size:
-        part = sock.recv(size - len(buf))
-        if not part:
+class TunneledClient(IClient):
+    def __init__(self, ip: int, logger: logging.Logger, encryption_key, sock: socket.socket | None = None) -> None:
+        self.sock = sock
+        self.ip = ip
+        self.logger = logger
+
+        self.encryption_key = encryption_key
+        self.encryption_completed = len(self.encryption_key) == 32
+
+    def send(self, pkt: Packet) -> None:
+        if self.encryption_completed and self.sock is not None:
+            pkt.encryption_key = self.encryption_key
+            pkt.src_ip = self.ip
+            self.sock.sendall(pkt.to_bytes())
+
+    def recv(self) -> Packet | None:
+        if self.encryption_completed and self.sock is not None:
+            return Packet.from_socket(self.sock, encryption_key=self.encryption_key)
+        else:
             return None
-        buf += part
-    return buf
+
+    def decrypt(self, pkt: Packet) -> Packet:
+        if self.encryption_completed:
+            return Packet(pkt.type, pkt.payload, pkt.dst_ip, pkt.src_ip, self.encryption_key)
+        else:
+            return pkt
 
 class VNetException(Exception): pass
 
@@ -199,6 +257,9 @@ class HandshakeError(VNetException):
         super().__init__("Handshake error: " + msg)
 
 
-__all__ = ['Packet', 'recv_exact', 'int_to_ip', 'ip_to_int',
-           'ERR_CODES', 'VNetException', 'HandshakeError', 'PacketError',
-           *packetTypes.keys()]
+__all__ = [
+    'Packet', 'recv_exact', 'int_to_ip', 'ip_to_int',
+    'ERR_CODES', 'VNetException', 'HandshakeError', 'PacketError',
+    "encrypt", "decrypt", "RemoteClient", "TunneledClient",
+    "encryptedTypes", "packetTypes"
+] + [x for x in packetTypes.keys() if not isinstance(x, int)]

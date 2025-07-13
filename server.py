@@ -14,4 +14,8 @@ class CoolServer(DoSP):
             self.stop()
 
 if __name__ == "__main__":
-    CoolServer().start()
+    server = CoolServer()
+    try:
+        server.start()
+    except KeyboardInterrupt:
+        server.stop()

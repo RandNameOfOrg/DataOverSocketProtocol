@@ -1,11 +1,11 @@
 from .protocol import *
-import os
+import os, logging, socket
 
 
 class Client:
     config: dict = {}
     vip_int: int # Virtual IP
-    tunnels: dict[int, RemoteClient] = {}
+    tunnels: dict[int, TunneledClient] = {}
 
     logger: logging.Logger
     sock: socket.socket
@@ -14,6 +14,8 @@ class Client:
         self.sock = socket.create_connection((ip, port))
         self.logger = logging.getLogger(__name__)
         self.do_handshake()
+
+        self.logger.level = logging.INFO
 
     def do_handshake(self, vip = None, cancel_on_RQIP = False):
         """Receive vIP and vnet config and request if needed"""
@@ -31,32 +33,44 @@ class Client:
             self.logger.info(f"[vnet] vnet version: {version}")
             self.logger.info(f"[vnet] vnet server token: {server_token}")
 
-        if vip:
-            try:
-                pkt = Packet(RQIP, bytes(ip_to_int(vip)))
-                self.sock.sendall(pkt.to_bytes())
-                # Wait for response
-                pkt = Packet.from_socket(self.sock, raise_on_error=True)
-                if pkt.type != RQIP:
-                    raise HandshakeError("failed to request IP")
-                self.vip_int = ip_to_int(pkt.payload.decode())
-                self.logger.info(f"[vnet] Requested IP: {int_to_ip(self.vip_int)}")
-            except HandshakeError as e:
-                self.logger.error(e)
-                self.sock.close()
-                if cancel_on_RQIP:
-                    self.logger.warning("Handshake failed, exiting...")
-                    exit(-1)
-                return
+        if not vip: return
 
-    def do_c2c_handshake(self, c2c_vip: str = None):
+        try:
+            pkt = Packet(RQIP, bytes(ip_to_int(vip)))
+            self.sock.sendall(pkt.to_bytes())
+            # Wait for response
+            pkt = Packet.from_socket(self.sock, raise_on_error=True)
+            if pkt.type != RQIP:
+                raise HandshakeError("failed to request IP")
+            self.vip_int = ip_to_int(pkt.payload.decode())
+            self.logger.info(f"[vnet] Requested IP: {int_to_ip(self.vip_int)}")
+        except HandshakeError as e:
+            self.logger.error(e)
+            self.sock.close()
+            if cancel_on_RQIP:
+                self.logger.warning("Handshake failed, exiting...")
+                exit(-1)
+            return
+
+    def do_c2c_handshake(self, c2c_vip: str | int | None = None):
         """Make client to client encrypted connection"""
+        c2c_vip = ip_to_int(c2c_vip) if isinstance(c2c_vip, str) else c2c_vip
+
         if not c2c_vip:
             raise HandshakeError("c2c_vip not provided")
 
-        pkt = Packet(S2C, bytes(), dst_ip=ip_to_int(c2c_vip))
-        key = os.urandom(32)
+        key = os.urandom(16)
+        pkt = Packet(S2C, bytes(HC2C) + key, dst_ip=c2c_vip)
+        self.sock.sendall(pkt.to_bytes())
 
+        # Wait for 2nd key part
+        pkt = Packet.from_socket(self.sock, raise_on_error=True)
+        print(pkt)
+        if pkt.type not in encryptedTypes and pkt.payload[0] != HC2C:
+            raise HandshakeError("failed to start c2c handshake")
+        key2 = pkt.payload[1:]
+        self.tunnels[c2c_vip] = TunneledClient(c2c_vip, logger=self.logger, encryption_key=key + key2)
+        self.logger.info(f"[vnet] Client to client connection started with {int_to_ip(c2c_vip)}")
 
     def __enter__(self):
         return self
@@ -65,6 +79,9 @@ class Client:
         self.sock.close()
 
     def send(self, pkt: Packet, on_error = None):
+        if pkt.dst_ip in self.tunnels:
+            self.tunnels[pkt.dst_ip].send(pkt)
+            return
         try:
             self.sock.sendall(pkt.to_bytes())
         except Exception as e:
@@ -77,6 +94,27 @@ class Client:
     def receive(self, on_error = None) -> Packet | None:
         try:
             pkt = Packet.from_socket(self.sock)
+            if pkt is None:
+                return None
+            tunnel = self.tunnels.get(pkt.src_ip, None)
+            print(pkt)
+            print(tunnel)
+
+            if pkt.type in encryptedTypes and HC2C in pkt.payload and tunnel is None: # start tunnel handshake with client
+                key2 = os.urandom(16)
+                pkt = Packet(S2C, bytes(HC2C) + key2, dst_ip=pkt.src_ip)
+                self.sock.sendall(pkt.to_bytes())
+
+                key = pkt.payload[1:]
+                tunnel = TunneledClient(pkt.src_ip, logger=self.logger, encryption_key=key + key2)
+                self.tunnels[pkt.src_ip] = tunnel
+            elif pkt.type in encryptedTypes and tunnel is not None:
+                # decrypt
+                pkt = tunnel.decrypt(pkt)
+                print(pkt)
+                pkt2 = Packet(pkt.type, pkt.payload, src_ip=self.vip_int, dst_ip=pkt.src_ip, encryption_key=tunnel.encryption_key)
+                print(pkt2)
+
         except Exception as e:
             self.logger.error(f"[vnet] Error receiving packet: {e}")
             if on_error is None:

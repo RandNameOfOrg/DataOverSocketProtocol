@@ -71,7 +71,7 @@ class DoSP:
         try:
             self.on_connect(sock, ip_int)
             while True:
-                pkt = Packet.from_socket(sock)
+                pkt = Packet.from_socket(sock, src_ip=ip_int)
                 if pkt is None:
                     break
                 self.handle_packet(pkt, sock, ip_int)
@@ -126,7 +126,7 @@ class DoSP:
                 dst_sock = self.clients.get(dst_ip)
             if dst_sock:
                 try:
-                    dst_sock.sendall(Packet(R4C, pkt.payload).to_bytes())
+                    dst_sock.sock.sendall(Packet(R4C, pkt.payload).to_bytes())
                 except Exception as e:
                     print(f"[vnet] Failed to route to {int_to_ip(dst_ip)}: {e}")
             else:
