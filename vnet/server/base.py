@@ -1,17 +1,41 @@
+import logging
 import socket
 import threading
 from vnet.protocol import *
 from vnet.iptools import int_to_ip, ip_to_int
 
 class DoSP:
-    def __init__(self, host="0.0.0.0", port=2424, ip_template="7.10.0.{x}"):
+    running  = True
+    dev_mode = False
+    logger: logging.Logger = logging.getLogger(__name__)
+    config = {
+        "host": "0.0.0.0",
+        "port": 7744,
+        "ip_template": "7.10.0.{x}",
+        "allow_local": False,
+        "clients_conf": [
+            0x01, # Version
+            0x0000, # Server token (allows to determine what types after 0x1F is)
+        ]
+    }
+
+    def __init__(self, host="0.0.0.0", port=7744,
+                 ip_template="7.10.0.{x}", allow_local = False):
         self.host = host
         self.port = port
         self.ip_template = ip_template
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.clients = {}  # ip_int -> socket
+        self.clients: dict[int, RemoteClient] = {}  # ip_int -> ServerClient
         self.lock = threading.Lock()
         self.assigned_ids = set()
+        self.allow_local = allow_local
+        self.config = {
+            "host": self.host,
+            "port": self.port,
+            "ip_template": self.ip_template,
+            "allow_local": self.allow_local,
+            "clients_conf": self.config["clients_conf"],
+        }
 
     def _next_ip(self):
         with self.lock:
@@ -29,17 +53,21 @@ class DoSP:
         self.sock.bind((self.host, self.port))
         self.sock.listen()
         print(f"[vnet] Server listening on {self.host}:{self.port}")
-        while True:
+        while self.running:
             try:
                 client_sock, addr = self.sock.accept()
                 threading.Thread(target=self.handle_client, args=(client_sock,), daemon=True).start()
             except Exception as e:
                 print(f"[vnet] Accept error: {e}")
 
+    def stop(self):
+        """sends a close packet to all clients and stops the server"""
+        self.sock.close()
+
     def handle_client(self, sock: socket.socket):
         ip_int, ip_id = self._next_ip()
         with self.lock:
-            self.clients[ip_int] = sock
+            self.clients[ip_int] = RemoteClient(sock, ip_int, self.logger)
         try:
             self.on_connect(sock, ip_int)
             while True:
@@ -68,6 +96,19 @@ class DoSP:
             sock.sendall(pkt.to_bytes())
         except Exception as e:
             print(f"[vnet] Failed to send IP to {int_to_ip(ip_int)}: {e}")
+        pkt = Packet(HSK, str(self.config["clients_conf"]).encode())
+        try:
+            sock.sendall(pkt.to_bytes())
+        except Exception as e:
+            print(f"[vnet] Failed to send config to {int_to_ip(ip_int)}: {e}")
+
+    def local_connect(self, client):
+        raise NotImplementedError("Go away")
+        int_ip, int_id = self._next_ip()
+        with self.lock:
+            self.clients[int_ip] = RemoteClient(client, int_ip, self.logger)
+
+
 
     def on_disconnect(self, ip_int: int):
         print(f"[vnet] Client disconnected: {int_to_ip(ip_int)}")
@@ -85,7 +126,7 @@ class DoSP:
                 dst_sock = self.clients.get(dst_ip)
             if dst_sock:
                 try:
-                    dst_sock.sendall(Packet(EXIT, pkt.payload).to_bytes())
+                    dst_sock.sendall(Packet(R4C, pkt.payload).to_bytes())
                 except Exception as e:
                     print(f"[vnet] Failed to route to {int_to_ip(dst_ip)}: {e}")
             else:
@@ -118,3 +159,4 @@ class DoSP:
             print(f"[LOG]{int_to_ip(ip_int)}] IP {int_to_ip(new_ip)} assigned to {int_to_ip(ip_int)}")
         else:
             print(f"[vnet] Unknown packet type {hex(pkt.type)} from {int_to_ip(ip_int)}")
+            sock.sendall(Packet(ERR, ERR_CODES.UKNP[0] + b"Unknown packet type").to_bytes())
