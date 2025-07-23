@@ -1,6 +1,8 @@
 from .protocol import *
 import os, logging, socket
 
+from .server import DoSP
+
 
 class Client:
     config: dict = {}
@@ -60,7 +62,7 @@ class Client:
             raise HandshakeError("c2c_vip not provided")
 
         key = os.urandom(16)
-        pkt = Packet(S2C, bytes(HC2C) + key, dst_ip=c2c_vip)
+        pkt = Packet(S2C, bytes(HC2C) + key, src_ip=self.vip_int, dst_ip=c2c_vip)
         self.sock.sendall(pkt.to_bytes())
 
         # Wait for 2nd key part
@@ -105,7 +107,7 @@ class Client:
                 print("Detected HC2C handshake initiation")
                 if pkt.src_ip not in self.tunnels:
                     key2 = os.urandom(16)
-                    response_pkt = Packet(S2C, bytes([HC2C]) + key2, dst_ip=pkt.src_ip)
+                    response_pkt = Packet(S2C, bytes([HC2C]) + key2, src_ip=self.vip_int, dst_ip=pkt.src_ip)
                     self.sock.sendall(response_pkt.to_bytes())
 
                     key = pkt.payload[1:]
@@ -136,9 +138,39 @@ class Client:
                 pass
             return None
 
-# class LocalClient(Client):
-#     """Client connected through another python process"""
-#     def __init__(self, server: DoSP, vip = None):
-#         if not (server.running and server.config["allow_local"]):
-#             raise HandshakeError("server is not running or allow_local is disabled")
-#         server.local_connect()
+
+class LocalClient(Client):
+    """Client connected through another python process"""
+
+    def __init__(self, server: DoSP, vip=None):
+        if not (server.running and server.config["allow_local"]):
+            raise HandshakeError("server is not running or allow_local is disabled")
+
+        self.server = server
+        self.vip_int = server.local_connect(self)
+        self.logger = logging.getLogger(__name__)
+        self.logger.level = logging.INFO
+
+        # Simulate handshake
+        if vip:
+            try:
+                pkt = Packet(RQIP, bytes(ip_to_int(vip)))
+                self.server.handle_packet(pkt, None, self.vip_int)
+            except Exception as e:
+                self.logger.error(f"Failed to request IP: {e}")
+
+    def send(self, pkt: Packet, on_error=None):
+        pkt.src_ip = self.vip_int
+        try:
+            self.server.handle_packet(pkt, None, self.vip_int)
+        except Exception as e:
+            self.logger.error(f"[vnet] Error sending packet: {e}")
+            if on_error is None:
+                raise PacketError("failed to send packet: " + str(e))
+            elif on_error == "ignore":
+                return
+
+    def receive(self, on_error=None) -> Packet | None:
+        # Local clients need to implement their own message queue
+        # This would require changes to the server to support message queues for local clients
+        raise NotImplementedError("Message queue for local clients not implemented yet")

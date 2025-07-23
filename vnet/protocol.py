@@ -17,7 +17,6 @@ FN   = 0x05  # Run function
 SD   = 0x06  # Server data
 RQIP = 0x07  # Request IP
 #-----  Server Answers  -----#
-R4C  = 0x0F  # Received from client
 SA   = 0x10  # Server answer
 EXIT = 0x11  # Exit
 ERR  = 0x12  # Error
@@ -29,8 +28,7 @@ packetTypes = {
     MSG: "MSG",   PING: "PING",
     S2C: "S2C",   GCL: "GCL",
     FN: "FN",     SD: "SD",
-    RQIP: "RQIP", R4C: "R4C",
-    SA: "SA",
+    RQIP: "RQIP", SA: "SA",
     EXIT: "EXIT", ERR: "ERR",
     AIP: "AIP",   HSK: "HSK",
     HC2C: "HC2C"
@@ -41,19 +39,19 @@ for k, v in packetTypes.items():
 packetTypes = packetTypes | _
 
 encryptedTypes = {
-    S2C, R4C
+    S2C
 }
 
 class ERR_CODES:
-    FNF   = 0x01
-    FF    = 0x02
-    S2CF  = 0x03
-    RQIPF = 0x04
-    SDF   = 0x05
-    GCLF  = 0x06
-    AIPF  = 0x07
-    HSKF  = 0x08
-    UKNP  = 0x09
+    FNF: bytes   = 0x01
+    FF: bytes    = 0x02
+    S2CF: bytes  = 0x03
+    RQIPF: bytes = 0x04
+    SDF: bytes   = 0x05
+    GCLF: bytes  = 0x06
+    AIPF: bytes  = 0x07
+    HSKF: bytes  = 0x08
+    UKNP: bytes  = 0x09
 
     code_to_error = {
         FNF:   "Function not found",
@@ -84,6 +82,10 @@ class ERR_CODES:
 
 GCM_NONCE_SIZE = 12 # For encryption
 
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+)
 
 def recv_exact(sock, size: int) -> bytes | None:
     buf = b''
@@ -100,14 +102,14 @@ def encrypt(data: bytes, key: bytes) -> bytes:
     if len(key) not in (16, 24, 32):
         raise ValueError("Key must be 16, 24, or 32 bytes")
 
-    # Генерируем случайный nonce (12 байт)
+    # Generate random nonce (12 bytes)
     nonce = get_random_bytes(GCM_NONCE_SIZE)
 
-    # Шифруем
+    # Encrypt
     cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
     ciphertext, tag = cipher.encrypt_and_digest(data)
 
-    # Формат: nonce (12) + ciphertext + tag (16)
+    # Format: nonce (12) + ciphertext + tag (16)
     return nonce + ciphertext + tag
 
 def decrypt(data: bytes, key: bytes) -> bytes:
@@ -116,14 +118,18 @@ def decrypt(data: bytes, key: bytes) -> bytes:
     if len(data) < GCM_NONCE_SIZE + 16:
         raise ValueError("Invalid ciphertext (too short)")
 
-    # Разделяем nonce, ciphertext и tag
+    # Split nonce, ciphertext and tag
     nonce = data[:GCM_NONCE_SIZE]
     ciphertext = data[GCM_NONCE_SIZE:-16]
     tag = data[-16:]
 
-    # Дешифруем
+    # Decrypt
     cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
-    return cipher.decrypt_and_verify(ciphertext, tag)
+    try:
+        return cipher.decrypt_and_verify(ciphertext, tag)
+    except ValueError as e:
+        raise ValueError("Decryption failed: invalid tag or corrupted data") from e
+
 
 class Packet:
     def __init__(self, type_: int, payload: bytes, dst_ip: int = None, src_ip: int = None, encryption_key = None):
@@ -181,7 +187,7 @@ class Packet:
         return Packet(type_, data, src_ip=src_ip)
 
     def __str__(self) -> str:
-        base = f"type={packetTypes[self.type]}, payload={self.payload}"
+        base = f"type={packetTypes[self.type]}, payload={self.payload}, encrypted={self.encryption_key is not None}"
         if self.dst_ip is None:
             return f"Packet({base})"
         return f"Packet({base}, dst_ip={int_to_ip(self.dst_ip)})"
@@ -207,8 +213,8 @@ class RemoteClient(IClient):
         self.logger = logger
 
         self.encryption_key = encryption_key
-        if self.encryption_key is not None:
-            self.encryption_completed = len(self.encryption_key) == 32
+        if encryption_key is not None:
+            self.encryption_completed = len(encryption_key) == 32
         else:
             self.encryption_completed = False
 
@@ -219,33 +225,65 @@ class RemoteClient(IClient):
     def recv(self) -> Packet | None:
         return Packet.from_socket(self.sock)
 
+
 class TunneledClient(IClient):
-    def __init__(self, ip: int, logger: logging.Logger, encryption_key, sock: socket.socket | None = None) -> None:
+    def __init__(self, ip: int, logger: logging.Logger, encryption_key, sock: socket.socket | None = None):
         self.sock = sock
         self.ip = ip
         self.logger = logger
-
         self.encryption_key = encryption_key
         self.encryption_completed = len(self.encryption_key) == 32
+        self.message_queue = []  # For local communication
 
     def send(self, pkt: Packet) -> None:
-        if self.encryption_completed and self.sock is not None:
-            pkt.encryption_key = self.encryption_key
-            pkt.src_ip = self.ip
-            self.sock.sendall(pkt.to_bytes())
-        else:
+        if not self.encryption_completed:
             self.logger.warning("TunneledClient.send called before encryption completed")
+            return
+
+        try:
+            encrypted_payload = encrypt(pkt.payload, self.encryption_key)
+            encrypted_pkt = Packet(pkt.type, encrypted_payload, pkt.dst_ip, pkt.src_ip)
+
+            if self.sock is not None:
+                self.sock.sendall(encrypted_pkt.to_bytes())
+            else:
+                # For local communication
+                self.message_queue.append(encrypted_pkt)
+        except Exception as e:
+            self.logger.error(f"Failed to encrypt and send packet: {e}")
 
     def recv(self) -> Packet | None:
-        if self.encryption_completed and self.sock is not None:
-            return Packet.from_socket(self.sock, encryption_key=self.encryption_key)
-        else:
+        if not self.encryption_completed:
+            self.logger.warning("TunneledClient.recv called before encryption completed")
+            return None
+
+        try:
+            if self.sock is not None:
+                raw_pkt = Packet.from_socket(self.sock)
+                if raw_pkt is None:
+                    return None
+                decrypted_payload = decrypt(raw_pkt.payload, self.encryption_key)
+                return Packet(raw_pkt.type, decrypted_payload, raw_pkt.dst_ip, raw_pkt.src_ip)
+            else:
+                # For local communication
+                if not self.message_queue:
+                    return None
+                raw_pkt = self.message_queue.pop(0)
+                decrypted_payload = decrypt(raw_pkt.payload, self.encryption_key)
+                return Packet(raw_pkt.type, decrypted_payload, raw_pkt.dst_ip, raw_pkt.src_ip)
+        except Exception as e:
+            self.logger.error(f"Failed to receive and decrypt packet: {e}")
             return None
 
     def decrypt(self, pkt: Packet) -> Packet:
-        if self.encryption_completed:
-            return Packet(pkt.type, pkt.payload, pkt.dst_ip, pkt.src_ip, self.encryption_key)
-        else:
+        if not self.encryption_completed:
+            return pkt
+
+        try:
+            decrypted_payload = decrypt(pkt.payload, self.encryption_key)
+            return Packet(pkt.type, decrypted_payload, pkt.dst_ip, pkt.src_ip)
+        except Exception as e:
+            self.logger.error(f"Decryption failed: {e}")
             return pkt
 
 class VNetException(Exception): pass

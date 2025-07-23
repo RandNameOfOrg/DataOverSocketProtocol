@@ -7,9 +7,12 @@ with Client(vip="7.10.0.1") as client:
 
     while True:
         pkt = client.receive()
-        print(pkt)
+        print(pkt, "From while True")
+        if pkt.src_ip is None:
+            print("No src_ip")
+            continue
         if pkt is None or pkt.type == EXIT:
             break
-        if pkt.type == R4C:
-            print("Received R4C packet from", int_to_ip(pkt.src_ip))
-            client.send(Packet(R4C, b"Hello client", dst_ip=pkt.src_ip), on_error="ignore")
+        if pkt.type == S2C:
+            print("Received S2C packet from", int_to_ip(pkt.src_ip))
+            client.send(Packet(S2C, b"Hello client", dst_ip=pkt.src_ip), on_error="ignore")

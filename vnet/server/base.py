@@ -55,13 +55,16 @@ class DoSP:
     def start(self):
         self.sock.bind((self.host, self.port))
         self.sock.listen()
-        print(f"[vnet] Server listening on {self.host}:{self.port}")
+        self.logger.info(f"Server listening on {self.host}:{self.port}")
         while self.running:
             try:
                 client_sock, addr = self.sock.accept()
                 threading.Thread(target=self.handle_client, args=(client_sock,), daemon=True).start()
+            except KeyboardInterrupt:
+                self.logger.info("Server stopped by user")
+                self.stop()
             except Exception as e:
-                print(f"[vnet] Accept error: {e}")
+                self.logger.error(f"Accept error: {e}")
 
     def stop(self):
         """sends a close packet to all clients and stops the server"""
@@ -99,13 +102,13 @@ class DoSP:
                     break
                 self.handle_packet(pkt, sock, ip_int)
         except ConnectionResetError:
-            print(f"[vnet] Client {int_to_ip(ip_int)} forcibly closed the connection")
+            self.logger.info(f"Client {int_to_ip(ip_int)} forcibly closed the connection")
         except Exception as e:
-            print(f"[vnet] Error with client {int_to_ip(ip_int)}: {e}")
+            self.logger.error(f"Error with client {int_to_ip(ip_int)}: {e}")
         finally:
             try:
                 sock.close()
-            except:
+            except Exception:
                 pass
             with self.lock:
                 self.clients.pop(ip_int, None)
@@ -113,61 +116,73 @@ class DoSP:
             self.on_disconnect(ip_int)
 
     def on_connect(self, sock: socket.socket, ip_int: int):
-        print(f"[vnet] Client connected: {int_to_ip(ip_int)}")
+        self.logger.info(f"Client connected: {int_to_ip(ip_int)}")
         pkt = Packet(AIP, ip_int.to_bytes(4, 'big'))
         try:
             sock.sendall(pkt.to_bytes())
         except Exception as e:
-            print(f"[vnet] Failed to send IP to {int_to_ip(ip_int)}: {e}")
+            self.logger.error(f"Failed to send IP to {int_to_ip(ip_int)}: {e}")
         pkt = Packet(HSK, str(self.config["clients_conf"]).encode())
         try:
             sock.sendall(pkt.to_bytes())
         except Exception as e:
-            print(f"[vnet] Failed to send config to {int_to_ip(ip_int)}: {e}")
+            self.logger.error(f"Failed to send config to {int_to_ip(ip_int)}: {e}")
 
     def local_connect(self, client):
-        raise NotImplementedError("Go away")
-        int_ip, int_id = self._next_ip()
+        """Connects a local client to the server without using sockets"""
+        if not (self.running and self.allow_local):
+            raise HandshakeError("server is not running or allow_local is disabled")
+
+        ip_int, ip_id = self._next_ip()
         with self.lock:
-            self.clients[int_ip] = RemoteClient(client, int_ip, self.logger)
+            self.clients[ip_int] = RemoteClient(None, ip_int, self.logger, allow_local=True)
+        try:
+            self.on_connect(None, ip_int)
+            return ip_int
+        except Exception as e:
+            self.logger.error(f"Local connection failed: {e}")
+            with self.lock:
+                self.clients.pop(ip_int, None)
+                self.assigned_ids.discard(ip_id)
+            raise HandshakeError("local connection failed")
 
     def on_disconnect(self, ip_int: int):
-        print(f"[vnet] Client disconnected: {int_to_ip(ip_int)}")
+        self.logger.info(f"Client disconnected: {int_to_ip(ip_int)}")
 
     def on_function(self, function_name: str, ip_int: int) -> (bool, str):
-        print(f"[vnet] Running function from {int_to_ip(ip_int)}: {function_name}")
+        self.logger.info(f"Running function from {int_to_ip(ip_int)}: {function_name}")
         return False, "Not enabled"
 
     def handle_packet(self, pkt: Packet, sock: socket.socket, ip_int: int):
         if pkt.type == MSG:
-            print(f"[MSG] {int_to_ip(ip_int)}: {pkt.payload.decode(errors='ignore')}")
+            self.logger.info(f"[MSG] {int_to_ip(ip_int)}: {pkt.payload.decode(errors='ignore')}")
         elif pkt.type == S2C:
             dst_ip = pkt.dst_ip
             with self.lock:
                 dst_sock = self.clients.get(dst_ip)
             if dst_sock:
                 try:
-                    dst_sock.sock.sendall(Packet(R4C, pkt.payload, src_ip=ip_int).to_bytes())
+                    dst_sock.sock.sendall(Packet(S2C, pkt.payload, dst_ip=dst_ip, src_ip=ip_int).to_bytes())
                 except Exception as e:
-                    print(f"[vnet] Failed to route to {int_to_ip(dst_ip)}: {e}")
+                    self.logger.error(f"Failed to route to {int_to_ip(dst_ip)}: {e}")
             else:
-                print(f"[vnet] No client with IP {int_to_ip(dst_ip)}")
+                self.logger.warning(f"No client with IP {int_to_ip(dst_ip)}")
         elif pkt.type == FN:
             done, msg = self.on_function(pkt.payload.decode(), ip_int)
             if not done:
-                print(f"[vnet] Function {pkt.payload.decode()} from {int_to_ip(ip_int)} failed: {msg}")
+                self.logger.error(f"Function {pkt.payload.decode()} from {int_to_ip(ip_int)} failed: {msg}")
                 sock.sendall(Packet(ERR, msg.encode(), src_ip=self.server_ip).to_bytes())
         elif pkt.type == GCL:
-            print(f"[LOG]{int_to_ip(ip_int)}] Getting clients list")
+            self.logger.debug(f"[LOG]{int_to_ip(ip_int)}] Getting clients list")
             with self.lock:
                 for ip_int in self.clients.keys():
                     sock.sendall(Packet(GCL, ip_int.to_bytes(4, 'big')).to_bytes())
         elif pkt.type == RQIP:
             new_ip = int.from_bytes(pkt.payload, 'big')
 
-            print(f"[LOG]{int_to_ip(ip_int)}] Requesting IP {int_to_ip(new_ip)}")
+            self.logger.debug(f"[LOG]{int_to_ip(ip_int)}] Requesting IP {int_to_ip(new_ip)}")
             if new_ip in self.assigned_ids:
-                print(f"[vnet] IP {int_to_ip(new_ip)} is already assigned to {int_to_ip(ip_int)}")
+                self.logger.warning(f"IP {int_to_ip(new_ip)} is already assigned to {int_to_ip(ip_int)}")
                 sock.sendall(Packet(ERR, b"IP already in use").to_bytes())
 
             with self.lock:
@@ -177,7 +192,7 @@ class DoSP:
                 self.assigned_ids.add(new_ip)
 
             sock.sendall(Packet(AIP, new_ip.to_bytes(4, 'big')).to_bytes())
-            print(f"[LOG]{int_to_ip(ip_int)}] IP {int_to_ip(new_ip)} assigned to {int_to_ip(ip_int)}")
+            self.logger.debug(f"[LOG]{int_to_ip(ip_int)}] IP {int_to_ip(new_ip)} assigned to {int_to_ip(ip_int)}")
         else:
-            print(f"[vnet] Unknown packet type {hex(pkt.type)} from {int_to_ip(ip_int)}")
-            sock.sendall(Packet(ERR, ERR_CODES.UKNP[0] + b"Unknown packet type").to_bytes())
+            self.logger.warning(f"Unknown packet type {hex(pkt.type)} from {int_to_ip(ip_int)}")
+            sock.sendall(Packet(ERR, ERR_CODES.UKNP).to_bytes())
