@@ -187,7 +187,7 @@ class DoSP:
                 self.logger.error(f"Function {pkt.payload.decode()} from {int_to_ip(ip_int)} failed: {msg}")
                 sock.sendall(Packet(ERR, msg.encode(), src_ip=self.server_ip).to_bytes())
         elif pkt.type == GCL:
-            self.logger.debug(f"[LOG]{int_to_ip(ip_int)}] Getting clients list")
+            self.logger.debug(f"[{int_to_ip(ip_int)}] Getting clients list")
             with self.lock:
                 for ip_int in self.clients.keys():
                     sock.sendall(Packet(GCL, ip_int.to_bytes(4, 'big')).to_bytes())
