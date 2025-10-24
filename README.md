@@ -42,7 +42,7 @@ types before 0x20 are reserved for build-in functions
 other types are reserved for future use
 ---
 
-## 🌐 VIPv4 — Virtual IP v4
+## 🌐 vIPv4 — Virtual IP v4
 
 Каждому клиенту сервер присваивает виртуальный IPv4-адрес по шаблону:
 
@@ -64,6 +64,11 @@ server.start()
 ```
 
 Клиенты получат IP вида `10.0.0.2`, `10.0.0.3`, …
+
+---
+
+## Interactive Client (IMC)
+Interactive Message Client is client (made by [__themaster1970sf__](https://github.com/themaster1970sf)) allows to send messages to server and other clients, for full command list type `/help` after starting client 
 
 ---
 
