@@ -11,18 +11,35 @@ class Client:
 
     logger: logging.Logger
     sock: socket.socket
+    running: bool
 
-    def __init__(self, ip: str = "127.0.0.1", port: int = 7744, vip = None):
-        self.sock = socket.create_connection((ip, port))
+    def __init__(self, host: str = "127.0.0.1", port: int = 7744, vip = None, fixed_vip = False):
+        """
+        Client constructor for DoS Protocol
+        :param host: DoSP server host (or host:port)
+        :param port: DoSP server port
+        :param vip: what vIP will be requested
+        :param fixed_vip: close connection if requested vIP can not be assigned
+        """
+        if ":" in host:
+            try:
+                host, port = host.split(":")
+                port = int(port)
+            except ValueError:
+                raise ConnectionError("Invalid host: \"{}\"".format(host))
         self.logger = logging.getLogger(__name__)
-        self.do_handshake()
+        self.initializate_connection(host, port, vip=vip, fixed_vip=False)
 
         self.logger.level = logging.INFO
+
+    def initializate_connection(self, host: str = "127.0.0.1", port: int = 7744, vip = None, fixed_vip = False):
+        self.sock = socket.create_connection((host, port))
+        self.do_handshake(vip=vip, cancel_on_RQIP_err=fixed_vip)
+        self.running = True
 
     def do_handshake(self, vip = None, cancel_on_RQIP_err = False):
         """Receive vIP and vnet config and request if needed"""
         pkt = Packet.from_socket(self.sock)
-        print(pkt)
         if pkt.type != AIP:
             raise HandshakeError("failed to assign virtual IP")
         self.vip_int = int.from_bytes(pkt.payload, 'big')
@@ -38,24 +55,35 @@ class Client:
         if not vip: return
 
         try:
-            pkt = Packet(RQIP, bytes(ip_to_int(vip)))
+            pkt = Packet(RQIP, payload=ip_to_int(vip).to_bytes(4, 'big'))
             self.sock.sendall(pkt.to_bytes())
             # Wait for response
             pkt = Packet.from_socket(self.sock, raise_on_error=True)
             if pkt.type != RQIP:
                 raise HandshakeError("failed to request IP")
-            self.vip_int = ip_to_int(pkt.payload.decode())
-            self.logger.info(f"[vnet] Requested IP: {int_to_ip(self.vip_int)}")
+            response = pkt.payload.decode()
+            print(response)
+            if "E:" in response:
+                raise HandshakeError("failed to handshake - {}".format(response.replace("E:", "")), response.replace("E:", ""))
+            if "D:" in response:
+                self.logger.debug(f"[vnet] Successfully requested ip: {response}")
+                additional_msg = response.replace("D:", " with msg: ")
+                if additional_msg == " with msg:":
+                    additional_msg = ""
+                pkt = Packet.from_socket(self.sock, raise_on_error=True)
+                self.vip_int = ip_to_int(pkt.payload.decode())
+                self.logger.info(f"[vnet] Requested IP: {int_to_ip(self.vip_int)}" + additional_msg)
         except HandshakeError as e:
-            self.logger.error(e)
-            self.sock.close()
+            self.logger.error("Error while requesting vIP: " + str(e.core_error))
             if cancel_on_RQIP_err:
                 self.logger.warning("Handshake failed, exiting...")
+                self.close()
                 exit(-1)
             return
 
     def do_c2c_handshake(self, c2c_vip: str | int | None = None):
         """Make client to client encrypted connection"""
+        if not self.running: return
         c2c_vip = ip_to_int(c2c_vip) if isinstance(c2c_vip, str) else c2c_vip
 
         if not c2c_vip:
@@ -81,6 +109,7 @@ class Client:
         self.sock.close()
 
     def send(self, pkt: Packet, on_error = None):
+        if not self.running: return
         pkt.src_ip = self.vip_int
         if pkt.dst_ip in self.tunnels:
             self.tunnels[pkt.dst_ip].send(pkt)
@@ -95,6 +124,8 @@ class Client:
                 return
 
     def receive(self, on_error=None) -> Packet | None:
+        if not self.check_connection() or not self.running:
+            return None
         try:
             pkt = Packet.from_socket(self.sock)
             if pkt is None:
@@ -132,12 +163,31 @@ class Client:
 
         except Exception as e:
             self.logger.error(f"[vnet] Error receiving packet: {e}")
-            if on_error is None:
+            if on_error is None and self.running:
                 raise PacketError("failed to receive packet: " + str(e))
-            elif on_error == "ignore":
+            elif on_error == "ignore" or on_error == "i":
                 pass
+            else:
+                self.logger.error(f"[vnet] Unknown \'on_error\' value: {e}")
+                raise PacketError("failed to receive packet: " + str(e))
             return None
 
+    def check_connection(self):
+        if not self.sock:
+            self.logger.warning("vnet connection not established")
+            return False
+        # TODO: send ping request to check connection, make that parallel (asyncio)
+
+        return True
+
+    def close(self):
+        self.logger.info(f"[vnet] closing connection")
+        self.running = False
+        try:
+            self.sock.sendall(Packet(EXIT, payload=b"CC").to_bytes())
+        except Exception:
+            pass
+        self.sock.close()
 
 class LocalClient(Client):
     """Client connected through another python process"""

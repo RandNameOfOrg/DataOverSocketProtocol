@@ -8,6 +8,11 @@ class DoSP:
     running  = True
     dev_mode = False
     logger: logging.Logger = logging.getLogger(__name__)
+    logger.setLevel(logging.DEBUG)
+    BANNED_IPs = [
+        ip_to_int("0.0.0.0"),
+        ip_to_int("127.0.0.1")
+    ]
     config = {
         "host": "0.0.0.0",
         "port": 7744,
@@ -21,6 +26,13 @@ class DoSP:
 
     def __init__(self, host="0.0.0.0", port=7744,
                  ip_template="7.10.0.{x}", allow_local = False):
+        """
+        Basic DoSP server with functionality to process all packets and client connections.
+        :param host: host address
+        :param port: host port
+        :param ip_template: what vIPs should be used for clients
+        :param allow_local: allow connection from local scripts (if other scripts have access to this class)
+        """
         self.host = host
         self.port = port
         self.ip_template = ip_template
@@ -63,6 +75,7 @@ class DoSP:
             except KeyboardInterrupt:
                 self.logger.info("Server stopped by user")
                 self.stop()
+                break
             except Exception as e:
                 self.logger.error(f"Accept error: {e}")
 
@@ -158,11 +171,12 @@ class DoSP:
             self.logger.info(f"[MSG] {int_to_ip(ip_int)}: {pkt.payload.decode(errors='ignore')}")
         elif pkt.type == S2C:
             dst_ip = pkt.dst_ip
+            src_ip = pkt.src_ip or ip_int
             with self.lock:
                 dst_sock = self.clients.get(dst_ip)
             if dst_sock:
                 try:
-                    dst_sock.sock.sendall(Packet(S2C, pkt.payload, dst_ip=dst_ip, src_ip=ip_int).to_bytes())
+                    dst_sock.sock.sendall(Packet(S2C, pkt.payload, dst_ip=dst_ip, src_ip=src_ip).to_bytes())
                 except Exception as e:
                     self.logger.error(f"Failed to route to {int_to_ip(dst_ip)}: {e}")
             else:
@@ -179,20 +193,29 @@ class DoSP:
                     sock.sendall(Packet(GCL, ip_int.to_bytes(4, 'big')).to_bytes())
         elif pkt.type == RQIP:
             new_ip = int.from_bytes(pkt.payload, 'big')
-
-            self.logger.debug(f"[LOG]{int_to_ip(ip_int)}] Requesting IP {int_to_ip(new_ip)}")
+            self.logger.debug(f"[{int_to_ip(ip_int)}] Requesting IP {int_to_ip(new_ip)}")
+            if new_ip in self.BANNED_IPs:
+                self.logger.warning(f"IP {int_to_ip(new_ip)} is in block list")
+                sock.sendall(Packet(RQIP, b"E:IP can't be used").to_bytes())
+                return
             if new_ip in self.assigned_ids:
                 self.logger.warning(f"IP {int_to_ip(new_ip)} is already assigned to {int_to_ip(ip_int)}")
-                sock.sendall(Packet(ERR, b"IP already in use").to_bytes())
-
-            with self.lock:
-                self.assigned_ids.remove(ip_int)
-                client_sock = self.clients.pop(ip_int, None)
-                self.clients[new_ip] = client_sock
-                self.assigned_ids.add(new_ip)
-
+                sock.sendall(Packet(RQIP, b"E:IP already in use").to_bytes())
+                return
+            try:
+                with self.lock:
+                    if ip_int in self.assigned_ids:
+                        self.assigned_ids.remove(ip_int)
+                    client_sock = self.clients.pop(ip_int, None)
+                    self.clients[new_ip] = client_sock
+                    self.assigned_ids.add(new_ip)
+            except Exception as e:
+                print("Failed to rewrite client id:", e)
+            finally:
+                self.on_disconnect(new_ip)
+            sock.sendall(Packet(RQIP, b"D:").to_bytes())
             sock.sendall(Packet(AIP, new_ip.to_bytes(4, 'big')).to_bytes())
-            self.logger.debug(f"[LOG]{int_to_ip(ip_int)}] IP {int_to_ip(new_ip)} assigned to {int_to_ip(ip_int)}")
+            self.logger.debug(f"{int_to_ip(ip_int)}] got new vIP {int_to_ip(new_ip)}")
         else:
             self.logger.warning(f"Unknown packet type {hex(pkt.type)} from {int_to_ip(ip_int)}")
-            sock.sendall(Packet(ERR, ERR_CODES.UKNP).to_bytes())
+            sock.sendall(Packet(ERR, bytes(int(ERR_CODES.UKNP))).to_bytes())

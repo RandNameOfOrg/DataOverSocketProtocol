@@ -3,6 +3,8 @@ import socket
 import struct
 
 from abc import ABC
+from enum import Enum
+
 from Crypto.Cipher import AES
 from Crypto.Random import get_random_bytes
 from .iptools import ip_to_int, int_to_ip
@@ -16,6 +18,7 @@ GCL  = 0x04  # Get clients list
 FN   = 0x05  # Run function
 SD   = 0x06  # Server data
 RQIP = 0x07  # Request IP
+GSI  = 0x08  # Get self-info (client will get info about itself)
 #-----  Server Answers  -----#
 SA   = 0x10  # Server answer
 EXIT = 0x11  # Exit
@@ -31,7 +34,7 @@ packetTypes = {
     RQIP: "RQIP", SA: "SA",
     EXIT: "EXIT", ERR: "ERR",
     AIP: "AIP",   HSK: "HSK",
-    HC2C: "HC2C"
+    HC2C: "HC2C", GSI: "GSI"
 }
 _ = {}
 for k, v in packetTypes.items():
@@ -42,15 +45,34 @@ encryptedTypes = {
     S2C
 }
 
+class ClientExitCodes(Enum):
+    """Codes that user gives to server (or opposite) when EXIT packet"""
+    """close without reason"""
+    ClientClosed = b"CC"
+    """Process exited"""
+    ProcessExit = b"EX"
+    """Unexpected error"""
+    UnexpectedError = b"UE"
+
 class ERR_CODES:
+    """Error codes"""
+    """Function not found"""
     FNF: bytes   = 0x01
+    """Function failed"""
     FF: bytes    = 0x02
+    """S2C failed"""
     S2CF: bytes  = 0x03
+    """RQIP failed"""
     RQIPF: bytes = 0x04
+    """SD packet failed"""
     SDF: bytes   = 0x05
+    """Get client list packet failed"""
     GCLF: bytes  = 0x06
+    """Assign vIP failed"""
     AIPF: bytes  = 0x07
+    """Handshake failed"""
     HSKF: bytes  = 0x08
+    """Unknown packet"""
     UKNP: bytes  = 0x09
 
     code_to_error = {
@@ -88,6 +110,8 @@ logging.basicConfig(
 )
 
 def recv_exact(sock, size: int) -> bytes | None:
+    if sock is None:
+        return None
     buf = b''
     while len(buf) < size:
         part = sock.recv(size - len(buf))
@@ -157,14 +181,14 @@ class Packet:
         header = recv_exact(sock, 5)
         if not header:
             if raise_on_error:
-                raise VNetException("failed to receive packet header")
+                raise VNetError("failed to receive packet header")
             return None
 
         type_, length = struct.unpack(">BI", header)
         data = recv_exact(sock, length)
         if data is None:
             if raise_on_error:
-                raise VNetException("failed to receive packet data")
+                raise VNetError("failed to receive packet data")
             return None
 
         if encryption_key and type_ in encryptedTypes:
@@ -178,7 +202,7 @@ class Packet:
         if type_ == S2C:
             if len(data) < 4:
                 if raise_on_error:
-                    raise VNetException("invalid S2C packet (missing dst_ip)")
+                    raise VNetError("invalid S2C packet (missing dst_ip)")
                 return None
             dst_ip = struct.unpack(">I", data[:4])[0]
             payload = data[4:]
@@ -286,20 +310,22 @@ class TunneledClient(IClient):
             self.logger.error(f"Decryption failed: {e}")
             return pkt
 
-class VNetException(Exception): pass
+class VNetError(Exception):
+    preset = "{}"
+    def __init__(self, msg: str, core_error: str | None = None):
+        self.core_error = core_error
+        super().__init__(self.preset.format(msg))
 
-class PacketError(VNetException):
-    def __init__(self, msg: str) -> None:
-        super().__init__("Packet error: " + msg)
+class PacketError(VNetError):
+    preset = "Packet error: {}"
 
-class HandshakeError(VNetException):
-    def __init__(self, msg: str) -> None:
-        super().__init__("Handshake error: " + msg)
+class HandshakeError(VNetError):
+    preset = "Handshake error: {}"
 
 
 __all__ = [
     'Packet', 'recv_exact', 'int_to_ip', 'ip_to_int',
-    'ERR_CODES', 'VNetException', 'HandshakeError', 'PacketError',
+    'ERR_CODES', 'VNetError', 'HandshakeError', 'PacketError',
     "encrypt", "decrypt", "RemoteClient", "TunneledClient",
-    "encryptedTypes", "packetTypes"
+    "encryptedTypes", "packetTypes", "ClientExitCodes"
 ] + [x for x in packetTypes.keys() if not isinstance(x, int)]

@@ -7,9 +7,9 @@
 ## 📦 Message Format
 
 ```
-
-\[1 byte TYPE] \[4 bytes LENGTH] \[optional 4 bytes DST\_IP] \[PAYLOAD]
-
+B = Byte(s)
+b = bit(s)  
+[2B TYPE] [4B LENGTH] [optional 4B DST_IP] [PAYLOAD]
 ````
 
 - `TYPE`: Тип сообщения (1 байт)
@@ -30,6 +30,7 @@
 | `0x05` | Запустить функцию       | `FN`      |
 | `0x06` | Save/Load data          | `SD`      |
 | `0x07` | Запрос IP               | `RQIP`    |
+| `0x08` | Получить self-info      | `GSI`     |
 | `0x0F` | Получен отв. от клиента | `R4C`     |
 | `0x10` | Ответ сервера           | `SA`      |
 | `0x11` | Переданное сообщение    | `EXIT`    |
@@ -69,4 +70,4 @@ server.start()
 ## TODO
 
 - [ ] allow `SD` (Save/Load data) in server
-- [ ] encrypt messages between 2 clients
+- [ ] encrypt messages between 2 clients (fix)
