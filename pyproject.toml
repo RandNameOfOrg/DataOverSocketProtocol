@@ -1,0 +1,21 @@
+[project]
+name = "DoSP"
+version = "0.1.0"
+description = "A DoSP (Data over Socket Protocol) client and server"
+authors = [{name = "daniil10295", email = "chernyak.daniil.2010@gmail.com"}]
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = []
+
+[build-system]
+requires = [
+    "setuptools>=42",
+    "wheel",
+    "pycryptodome"
+]
+build-backend = "setuptools.build_meta"

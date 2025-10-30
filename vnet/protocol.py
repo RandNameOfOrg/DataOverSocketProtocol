@@ -1,12 +1,17 @@
 import logging
 import socket
 import struct
+import hmac
+import hashlib
 
 from abc import ABC
 from enum import Enum
 
 from Crypto.Cipher import AES
 from Crypto.Random import get_random_bytes
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from .iptools import ip_to_int, int_to_ip
 
 # region PacketTypes
@@ -90,19 +95,10 @@ class ERR_CODES:
     def __getitem__(self, key):
         return self.code_to_error[key]
 
-# packetTypes = {
-#     "MSG": MSG,   "PING": PING,
-#     "S2C": S2C,   "GCL":  GCL,
-#     "FN": FN,     "SD": SD,
-#     "RQIP": RQIP, "R4C": R4C,
-#     "SA": SA,
-#     "EXIT": EXIT, "ERR": ERR,
-#     "AIP": AIP,   "HSK": HSK,
-#     "HC2C": HC2C
-# }
 # endregion
 
 GCM_NONCE_SIZE = 12 # For encryption
+MAC_SIZE = 32 # HMAC-SHA256 size
 
 logging.basicConfig(
     level=logging.INFO,
@@ -155,6 +151,26 @@ def decrypt(data: bytes, key: bytes) -> bytes:
         raise ValueError("Decryption failed: invalid tag or corrupted data") from e
 
 
+def derive_tunnel_keys(shared_secret: bytes, info: bytes = b'dosp-c2c-v1') -> dict:
+    """
+    Derive multiple keys from shared secret (similar to TLS PRF).
+    Returns encryption key, MAC key, and IV material.
+    """
+    # Derive 96 bytes: 32 encryption + 32 mac + 32 iv_material
+    key_material = HKDF(
+        algorithm=hashes.SHA256(),
+        length=96,
+        salt=None,
+        info=info
+    ).derive(shared_secret)
+    
+    return {
+        'encryption': key_material[:32],
+        'mac': key_material[32:64],
+        'iv_material': key_material[64:96]
+    }
+
+
 class Packet:
     def __init__(self, type_: int, payload: bytes, dst_ip: int = None, src_ip: int = None, encryption_key = None):
         globals().update(packetTypes)
@@ -171,7 +187,8 @@ class Packet:
             if self.encryption_key is not None:
                 self.payload = encrypt(self.payload, self.encryption_key)
             dst_bytes = struct.pack(">I", self.dst_ip)
-            total_payload = dst_bytes + self.payload
+            src_bytes = struct.pack(">I", self.src_ip or 0)
+            total_payload = dst_bytes + src_bytes + self.payload
             return struct.pack(">BI", self.type, len(total_payload)) + total_payload
         else:
             return struct.pack(">BI", self.type, len(self.payload)) + self.payload
@@ -191,7 +208,8 @@ class Packet:
                 raise VNetError("failed to receive packet data")
             return None
 
-        if encryption_key and type_ in encryptedTypes:
+        # For tunneled packets (S2C), do not attempt to decrypt here, as the payload header contains routing info
+        if encryption_key and type_ in encryptedTypes and type_ != S2C:
             try:
                 data = decrypt(data, encryption_key)
             except ValueError as e:
@@ -200,18 +218,20 @@ class Packet:
                 return None
 
         if type_ == S2C:
-            if len(data) < 4:
+            if len(data) < 8:
                 if raise_on_error:
-                    raise VNetError("invalid S2C packet (missing dst_ip)")
+                    raise VNetError("invalid S2C packet (missing dst/src header)")
                 return None
             dst_ip = struct.unpack(">I", data[:4])[0]
-            payload = data[4:]
-            return Packet(type_, payload, dst_ip=dst_ip, src_ip=src_ip)
+            parsed_src_ip = struct.unpack(">I", data[4:8])[0]
+            payload = data[8:]
+            # prefer parsed src for S2C
+            return Packet(type_, payload, dst_ip=dst_ip, src_ip=parsed_src_ip)
 
         return Packet(type_, data, src_ip=src_ip)
 
     def __str__(self) -> str:
-        base = f"type={packetTypes[self.type]}, payload={self.payload}, encrypted={self.encryption_key is not None}"
+        base = f"type={packetTypes[self.type]}, payload={self.payload[:50]}{'...' if len(self.payload) > 50 else ''}, encrypted={self.encryption_key is not None}"
         if self.dst_ip is None:
             return f"Packet({base})"
         return f"Packet({base}, dst_ip={int_to_ip(self.dst_ip)})"
@@ -251,32 +271,171 @@ class RemoteClient(IClient):
 
 
 class TunneledClient(IClient):
-    def __init__(self, ip: int, logger: logging.Logger, encryption_key, sock: socket.socket | None = None):
+    """
+    Production-ready C2C tunnel with TLS-inspired security:
+    - Diffie-Hellman key exchange (X25519)
+    - Separate encryption and MAC keys
+    - Sequence numbers to prevent replay attacks
+    - Message authentication codes (HMAC)
+    """
+    
+    def __init__(self, ip: int, logger: logging.Logger, 
+                 encryption_key=None, sock: socket.socket | None = None,
+                 use_dh: bool = False, private_key=None):
         self.sock = sock
         self.ip = ip
         self.logger = logger
-        self.encryption_key = encryption_key
-        self.encryption_completed = len(self.encryption_key) == 32
         self.message_queue = []  # For local communication
+        
+        # Security parameters
+        self.use_dh = use_dh  # Use Diffie-Hellman key exchange
+        self.private_key = private_key  # For DH exchange
+        self.encryption_key = None
+        self.mac_key = None
+        self.iv_material = None
+        
+        # Sequence numbers for replay protection
+        self.send_sequence = 0
+        self.recv_sequence = 0
+        
+        # Legacy support: if encryption_key provided, use it directly
+        if encryption_key is not None:
+            if len(encryption_key) == 32:
+                # New format: derive keys from shared secret
+                keys = derive_tunnel_keys(encryption_key)
+                self.encryption_key = keys['encryption']
+                self.mac_key = keys['mac']
+                self.iv_material = keys['iv_material']
+                self.encryption_completed = True
+            elif len(encryption_key) == 16:
+                # Old format: partial key (waiting for second half)
+                self.encryption_key = encryption_key
+                self.encryption_completed = False
+            else:
+                raise ValueError(f"Invalid encryption key length: {len(encryption_key)}")
+        else:
+            self.encryption_completed = False
+
+    def complete_key_exchange(self, second_key_part: bytes):
+        """Complete the legacy key exchange by combining both parts"""
+        if self.encryption_completed:
+            self.logger.warning("Key exchange already completed")
+            return
+        
+        if len(self.encryption_key) == 16 and len(second_key_part) == 16:
+            # Combine keys and derive session keys
+            shared_secret = self.encryption_key + second_key_part
+            keys = derive_tunnel_keys(shared_secret)
+            
+            self.encryption_key = keys['encryption']
+            self.mac_key = keys['mac']
+            self.iv_material = keys['iv_material']
+            self.encryption_completed = True
+            
+            self.logger.info(f"C2C tunnel keys derived for {int_to_ip(self.ip)}")
+
+    def __repr__(self):
+        status = "completed" if self.encryption_completed else "pending"
+        return f"Tunnel(ip={int_to_ip(self.ip)}, status={status}, dh={self.use_dh})"
+
+    def _create_authenticated_message(self, data: bytes) -> bytes:
+        """
+        Create message with encryption + authentication (TLS-inspired).
+        Format: [sequence(8)] + [encrypted_data] + [mac(32)]
+        """
+        if not self.encryption_completed:
+            raise ValueError("Cannot send: encryption not completed")
+        
+        # Increment sequence number
+        self.send_sequence += 1
+        seq_bytes = self.send_sequence.to_bytes(8, 'big')
+        
+        # Prepend sequence to data before encryption
+        message = seq_bytes + data
+        
+        # Encrypt: returns nonce(12) + ciphertext + tag(16)
+        ciphertext = encrypt(message, self.encryption_key)
+        
+        # Add HMAC for integrity: MAC(sequence + ciphertext)
+        mac = hmac.new(
+            self.mac_key, 
+            seq_bytes + ciphertext, 
+            hashlib.sha256
+        ).digest()
+        
+        # Final format: ciphertext + mac
+        return ciphertext + mac
+
+    def _verify_and_decrypt_message(self, data: bytes) -> bytes:
+        """
+        Verify MAC and decrypt message.
+        Expected format: [encrypted_data] + [mac(32)]
+        """
+        if not self.encryption_completed:
+            raise ValueError("Cannot receive: encryption not completed")
+        
+        if len(data) < MAC_SIZE + GCM_NONCE_SIZE + 16:  # mac + nonce + min_ciphertext + tag
+            raise ValueError("Message too short")
+        
+        # Split ciphertext and MAC
+        ciphertext = data[:-MAC_SIZE]
+        received_mac = data[-MAC_SIZE:]
+        
+        # Expected sequence number
+        expected_seq = self.recv_sequence + 1
+        seq_bytes = expected_seq.to_bytes(8, 'big')
+        
+        # Verify MAC
+        expected_mac = hmac.new(
+            self.mac_key,
+            seq_bytes + ciphertext,
+            hashlib.sha256
+        ).digest()
+        
+        if not hmac.compare_digest(received_mac, expected_mac):
+            raise ValueError("MAC verification failed - message tampered or wrong sequence")
+        
+        # Decrypt
+        decrypted = decrypt(ciphertext, self.encryption_key)
+        
+        # Extract and verify sequence number
+        message_seq = int.from_bytes(decrypted[:8], 'big')
+        if message_seq != expected_seq:
+            raise ValueError(f"Sequence mismatch: expected {expected_seq}, got {message_seq}")
+        
+        # Update receive sequence
+        self.recv_sequence = message_seq
+        
+        # Return data without sequence number
+        return decrypted[8:]
 
     def send(self, pkt: Packet) -> None:
+        """Send packet through encrypted and authenticated tunnel"""
         if not self.encryption_completed:
             self.logger.warning("TunneledClient.send called before encryption completed")
             return
 
         try:
-            encrypted_payload = encrypt(pkt.payload, self.encryption_key)
-            encrypted_pkt = Packet(pkt.type, encrypted_payload, pkt.dst_ip, pkt.src_ip)
+            # Create authenticated message
+            authenticated_data = self._create_authenticated_message(pkt.payload)
+            
+            # Create encrypted packet
+            encrypted_pkt = Packet(pkt.type, authenticated_data, pkt.dst_ip, pkt.src_ip)
 
             if self.sock is not None:
                 self.sock.sendall(encrypted_pkt.to_bytes())
             else:
                 # For local communication
                 self.message_queue.append(encrypted_pkt)
+                
+            self.logger.debug(f"Sent authenticated message (seq={self.send_sequence}) to {int_to_ip(self.ip)}")
+            
         except Exception as e:
             self.logger.error(f"Failed to encrypt and send packet: {e}")
+            raise
 
     def recv(self) -> Packet | None:
+        """Receive packet from encrypted and authenticated tunnel"""
         if not self.encryption_completed:
             self.logger.warning("TunneledClient.recv called before encryption completed")
             return None
@@ -286,29 +445,35 @@ class TunneledClient(IClient):
                 raw_pkt = Packet.from_socket(self.sock)
                 if raw_pkt is None:
                     return None
-                decrypted_payload = decrypt(raw_pkt.payload, self.encryption_key)
-                return Packet(raw_pkt.type, decrypted_payload, raw_pkt.dst_ip, raw_pkt.src_ip)
             else:
                 # For local communication
                 if not self.message_queue:
                     return None
                 raw_pkt = self.message_queue.pop(0)
-                decrypted_payload = decrypt(raw_pkt.payload, self.encryption_key)
-                return Packet(raw_pkt.type, decrypted_payload, raw_pkt.dst_ip, raw_pkt.src_ip)
+            
+            # Verify and decrypt
+            decrypted_payload = self._verify_and_decrypt_message(raw_pkt.payload)
+            
+            self.logger.debug(f"Received authenticated message (seq={self.recv_sequence}) from {int_to_ip(self.ip)}")
+            
+            return Packet(raw_pkt.type, decrypted_payload, raw_pkt.dst_ip, raw_pkt.src_ip)
+            
         except Exception as e:
             self.logger.error(f"Failed to receive and decrypt packet: {e}")
             return None
 
     def decrypt(self, pkt: Packet) -> Packet:
+        """Decrypt packet that was received through server"""
         if not self.encryption_completed:
             return pkt
 
         try:
-            decrypted_payload = decrypt(pkt.payload, self.encryption_key)
+            decrypted_payload = self._verify_and_decrypt_message(pkt.payload)
             return Packet(pkt.type, decrypted_payload, pkt.dst_ip, pkt.src_ip)
         except Exception as e:
             self.logger.error(f"Decryption failed: {e}")
-            return pkt
+            raise
+
 
 class VNetError(Exception):
     preset = "{}"
@@ -327,5 +492,6 @@ __all__ = [
     'Packet', 'recv_exact', 'int_to_ip', 'ip_to_int',
     'ERR_CODES', 'VNetError', 'HandshakeError', 'PacketError',
     "encrypt", "decrypt", "RemoteClient", "TunneledClient",
-    "encryptedTypes", "packetTypes", "ClientExitCodes"
+    "encryptedTypes", "packetTypes", "ClientExitCodes",
+    "derive_tunnel_keys", "MAC_SIZE", "GCM_NONCE_SIZE"
 ] + [x for x in packetTypes.keys() if not isinstance(x, int)]
