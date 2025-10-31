@@ -10,13 +10,14 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
-dependencies = []
+dependencies = [
+    "pycryptodome",
+    "cryptography"
+]
 
 [build-system]
 requires = [
     "setuptools>=42",
-    "wheel",
-    "pycryptodome",
-    "cryptography"
+    "wheel"
 ]
 build-backend = "setuptools.build_meta"
