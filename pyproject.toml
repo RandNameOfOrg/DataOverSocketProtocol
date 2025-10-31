@@ -16,6 +16,7 @@ dependencies = []
 requires = [
     "setuptools>=42",
     "wheel",
-    "pycryptodome"
+    "pycryptodome",
+    "cryptography"
 ]
 build-backend = "setuptools.build_meta"
