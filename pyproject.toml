@@ -15,6 +15,9 @@ dependencies = [
     "cryptography"
 ]
 
+[tool.setuptools]
+packages = ["dosp"]
+
 [build-system]
 requires = [
     "setuptools>=42",

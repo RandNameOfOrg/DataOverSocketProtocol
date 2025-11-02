@@ -1,4 +1,6 @@
 # DoSP Protocol Specification
+![PyPI - Version](https://img.shields.io/pypi/v/DoSP)
+![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/RandNameOfOrg/DataOverSocketProtocol/python-publish.yml)
 
 **DoSP** (Default or Simple Protocol) — TCP-протокол, работающий по умолчанию на порту `7744`. Используется для маршрутизации и пересылки сообщений между клиентами через центральный сервер.
 
