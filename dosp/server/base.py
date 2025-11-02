@@ -1,9 +1,8 @@
 import logging
 import socket
 import threading
-import hashlib
-from vnet.protocol import *
-from vnet.iptools import int_to_ip, ip_to_int
+from hashlib import sha256
+from dosp.protocol import *
 
 class RemoteServer:
     def __init__(self, host: str, port: int, ip_template: str, hop_count: int = 0, source_peer_idx: int | None = None):
@@ -14,7 +13,7 @@ class RemoteServer:
         self.source_peer_idx = source_peer_idx
 
     def address(self) -> tuple[str, int]:
-        return (self.host, self.port)
+        return self.host, self.port
 
     def to_bytes(self) -> bytes:
         host_b = self.host.encode()
@@ -96,7 +95,7 @@ class DoSP:
     }
 
     def __init__(self, host="0.0.0.0", port=7744,
-                 ip_template="7.10.0.{x}", allow_local = False):
+                 ip_template="7.10.0.{x}", allow_local = False, logger_name: str | None = None):
         """
         Basic DoSP server with functionality to process all packets and client connections.
         :param host: host address
@@ -107,6 +106,13 @@ class DoSP:
         self.host = host
         self.port = port
         self.ip_template = ip_template
+
+        # Configure instance logger
+        try:
+            if logger_name:
+                self.logger = logging.getLogger(logger_name)
+        except Exception:
+            pass
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.clients: dict[int, RemoteClient] = {}  # ip_int -> ServerClient
@@ -281,6 +287,7 @@ class DoSP:
                 pass
 
     def _candidate_peers_for_ip(self, dst_ip: int, exclude_peer_idx: int | None = None) -> list[int]:
+        """Returns list of candidate peers (other servers) who can contain given IP address (client)."""
         candidates: list[int] = []
         # Direct templates first
         for tmpl, idx in self.direct_templates.items():
@@ -307,9 +314,10 @@ class DoSP:
         candidates.extend([idx for _, idx in ranked])
         return candidates
 
-    def _pkt_digest(self, payload: bytes) -> int:
+    @staticmethod
+    def _pkt_digest(payload: bytes) -> int:
         try:
-            return int.from_bytes(hashlib.sha256(payload[:64]).digest()[:4], 'big')
+            return int.from_bytes(sha256(payload[:64]).digest()[:4], 'big')
         except Exception:
             return 0
 
@@ -339,7 +347,10 @@ class DoSP:
                 with self.peer_locks[peer_idx]:
                     psock.sendall(Packet(S2C, payload, dst_ip=dst_ip, src_ip=src_ip).to_bytes())
                 self._decrement_ttl(dst_ip, digest)
-                self.logger.debug(f"Forwarded S2C to peer[{peer_idx}] for {int_to_ip(dst_ip)} (ttl left {self._ttl_left(dst_ip, digest)})")
+                try:
+                    self.logger.info(f"FWD S2C peer[{peer_idx}] {int_to_ip(src_ip)} -> {int_to_ip(dst_ip)} (ttl {self._ttl_left(dst_ip, digest)})")
+                except Exception:
+                    self.logger.info(f"FWD S2C peer[{peer_idx}] -> {int_to_ip(dst_ip)} (ttl {self._ttl_left(dst_ip, digest)})")
                 return True
             except Exception as e:
                 self.logger.error(f"Peer[{peer_idx}] send failed: {e}")
@@ -434,17 +445,21 @@ class DoSP:
             self.learned_next_hops.pop(tmpl, None)
             self.remote_servers.pop(tmpl, None)
 
-    def _next_ip(self):
+    def _next_ip(self) -> tuple[int, int]:
+        """
+         Gives the next vIP available address.
+         :returns: ip_int, ip_num (`x` from preset)
+        """
         with self.lock:
-            x = 2
+            ip_num = 2
             while True:
-                if x not in self.assigned_ids:
-                    ip_str = self.ip_template.replace("{x}", str(x))
+                if ip_num not in self.assigned_ids:
+                    ip_str = self.ip_template.replace("{x}", str(ip_num))
                     ip_int = ip_to_int(ip_str)
                     if ip_int not in self.clients:
-                        self.assigned_ids.add(x)
-                        return ip_int, x
-                x += 1
+                        self.assigned_ids.add(ip_num)
+                        return ip_int, ip_num
+                ip_num += 1
 
     def start(self):
         # Initialize configured peers
@@ -521,10 +536,11 @@ class DoSP:
         except Exception as e:
             self.logger.error(f"Error with client {int_to_ip(ip_int)}: {e}")
         finally:
-            try:
+            # try:
+            if sock:
                 sock.close()
-            except Exception:
-                pass
+            # except:
+            #     pass
             with self.lock:
                 self.clients.pop(ip_int, None)
                 self.assigned_ids.discard(ip_id)
@@ -533,16 +549,13 @@ class DoSP:
     def on_connect(self, sock: socket.socket, ip_int: int):
         self.logger.info(f"Client connected: {int_to_ip(ip_int)}")
         if sock is not None:
-            pkt = Packet(AIP, ip_int.to_bytes(4, 'big'))
+            pkt_aip = Packet(AIP, ip_int.to_bytes(4, 'big'))
+            pkt_hsk = Packet(HSK, str(self.config["clients_conf"]).encode())
             try:
-                sock.sendall(pkt.to_bytes())
+                sock.sendall(pkt_aip.to_bytes())
+                sock.sendall(pkt_hsk.to_bytes())
             except Exception as e:
-                self.logger.error(f"Failed to send IP to {int_to_ip(ip_int)}: {e}")
-            pkt = Packet(HSK, str(self.config["clients_conf"]).encode())
-            try:
-                sock.sendall(pkt.to_bytes())
-            except Exception as e:
-                self.logger.error(f"Failed to send config to {int_to_ip(ip_int)}: {e}")
+                self.logger.error(f"Failed to send IP or config to {int_to_ip(ip_int)}: {e}")
 
     def local_connect(self, client):
         """Connects a local client to the server without using sockets"""
@@ -565,16 +578,20 @@ class DoSP:
     def on_disconnect(self, ip_int: int):
         self.logger.info(f"Client disconnected: {int_to_ip(ip_int)}")
 
-    def on_function(self, function_name: str, ip_int: int) -> (bool, str):
+    def on_function(self, function_name: str, ip_int: int) -> tuple[bool, str]:
         self.logger.info(f"Running function from {int_to_ip(ip_int)}: {function_name}")
         return False, "Not enabled"
 
     def handle_packet(self, pkt: Packet, sock: socket.socket, ip_int: int):
+        src_ip = pkt.src_ip or ip_int
+
         if pkt.type == MSG:
             self.logger.info(f"[MSG] {int_to_ip(ip_int)}: {pkt.payload.decode(errors='ignore')}")
+        elif pkt.type == EXIT:
+            # TODO: Make it good
+            pass
         elif pkt.type == S2C:
             dst_ip = pkt.dst_ip
-            src_ip = pkt.src_ip or ip_int
             # Try local delivery first
             with self.lock:
                 dst_sock = self.clients.get(dst_ip)
@@ -596,8 +613,9 @@ class DoSP:
         elif pkt.type == GCL:
             self.logger.debug(f"[{int_to_ip(ip_int)}] Getting clients list")
             with self.lock:
-                for ip_int in self.clients.keys():
-                    sock.sendall(Packet(GCL, ip_int.to_bytes(4, 'big')).to_bytes())
+                clients_ips = [ip.to_bytes(4, 'big') for ip in self.clients.keys()]
+                payload = b"".join(clients_ips)
+                sock.sendall(Packet(GCL, payload).to_bytes())
         elif pkt.type == SD:
             # Attempt to map this socket to a known peer and ingest advertisement
             try:

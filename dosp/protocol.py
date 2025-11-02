@@ -45,12 +45,13 @@ _ = {}
 for k, v in packetTypes.items():
     _[v] = k
 packetTypes = packetTypes | _
+del _
 
 encryptedTypes = {
     S2C
 }
 
-class ClientExitCodes(Enum):
+class ClientExitCodes:
     """Codes that user gives to server (or opposite) when EXIT packet"""
     """close without reason"""
     ClientClosed = b"CC"

@@ -1,5 +1,5 @@
-from vnet.client import Client
-from vnet.protocol import *
+from dosp.client import Client
+from dosp.protocol import *
 import threading
 import time
 import sys

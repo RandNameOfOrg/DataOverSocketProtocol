@@ -1,0 +1,12 @@
+# GUI Requirements for DoSP Client
+# Install with: pip install -r gui/requirements.txt
+
+# GUI Framework
+customtkinter>=5.2.0
+
+# Core DoSP dependencies (if not installed via main package)
+pycryptodome>=3.19.0
+cryptography>=41.0.0
+
+# Optional for enhanced features
+# Pillow>=10.0.0  # For custom icons/images

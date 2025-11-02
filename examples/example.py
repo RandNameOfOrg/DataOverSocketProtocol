@@ -1,5 +1,5 @@
-from vnet.client import Client
-from vnet.protocol import *
+from dosp.client import Client
+from dosp.protocol import *
 
 with Client(host="main.hosts.daniil10295.ru:7744", vip="7.10.0.1") as client:
     print("vIP:", int_to_ip(client.vip_int))

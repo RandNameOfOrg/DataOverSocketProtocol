@@ -3,8 +3,8 @@ import sys
 import threading
 import time
 
-from vnet.client import Client
-from vnet.protocol import Packet, S2C, MSG, int_to_ip, ip_to_int
+from dosp.client import Client
+from dosp.protocol import Packet, S2C, MSG, int_to_ip, ip_to_int
 
 HOST = os.getenv("VNET_HOST", "127.0.0.1")
 PORT = int(os.getenv("VNET_PORT", "7744"))

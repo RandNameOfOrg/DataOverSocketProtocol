@@ -1,5 +1,6 @@
 from .protocol import *
 import os, logging, socket, time
+from collections import deque
 
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives import serialization
@@ -16,7 +17,7 @@ class Client:
     sock: socket.socket
     running: bool
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 7744, vip = None, fixed_vip = False):
+    def __init__(self, host: str = "127.0.0.1", port: int = 7744, vip = None, fixed_vip = False, client_id: int | None = None):
         """
         Client constructor for DoS Protocol
         :param host: DoSP server host (or host:port)
@@ -31,6 +32,12 @@ class Client:
             except ValueError:
                 raise ConnectionError("Invalid host: \"{}\"".format(host))
         self.logger = logging.getLogger(__name__)
+        # Short S2C protection counters per peer
+        self._short_s2c: dict[int, deque] = {}
+        self._short_s2c_last_alert: dict[int, float] = {}
+        self._short_s2c_threshold = 10   # events
+        self._short_s2c_window = 60.0    # seconds
+        self._short_s2c_cooldown = 60.0  # seconds
         self.initializate_connection(host, port, vip=vip, fixed_vip=fixed_vip)
 
         self.logger.level = logging.INFO
@@ -130,10 +137,15 @@ class Client:
         
         self.logger.debug(f"[vnet] Sent DH public key to {int_to_ip(c2c_vip)}")
         
-        # 4. Wait for their public key
+        # 4. Wait for their public key or an HC2C error
         pkt = Packet.from_socket(self.sock, raise_on_error=True)
         if pkt.type not in encryptedTypes or len(pkt.payload) < 1 or pkt.payload[0] != HC2C:
             raise HandshakeError("Failed DH c2c handshake: invalid response")
+        
+        # Check for HC2C error frame: [HC2C, 0xFF, reason]
+        if len(pkt.payload) >= 2 and pkt.payload[1] == 0xFF:
+            reason = pkt.payload[2:].decode(errors='ignore')
+            raise HandshakeError(f"Failed DH c2c handshake: {reason}")
         
         # Parse response: [HC2C(1)] + [session_id(8)] + [timestamp(8)] + [public_key(32)]
         if len(pkt.payload) < 49:  # 1 + 8 + 8 + 32
@@ -149,8 +161,11 @@ class Client:
             self.logger.warning(f"[vnet] Timestamp mismatch: {current_time - recv_timestamp}s difference")
         
         # 5. Perform Diffie-Hellman exchange
-        peer_public_key = x25519.X25519PublicKey.from_public_bytes(peer_public_bytes)
-        shared_secret = private_key.exchange(peer_public_key)
+        try:
+            peer_public_key = x25519.X25519PublicKey.from_public_bytes(peer_public_bytes)
+            shared_secret = private_key.exchange(peer_public_key)
+        except Exception as e:
+            raise HandshakeError(f"Failed DH c2c handshake: invalid public key: {e}")
         
         # 6. Derive session keys using HKDF with session context
         context_info = b'dosp-c2c-dh-v1' + session_id + recv_session_id
@@ -240,8 +255,13 @@ class Client:
 
             self.logger.debug(f"Received raw packet: {pkt}")
 
-            # Check if this is a handshake initiation from another client
+            # Check if this is a handshake initiation or error from another client
             if pkt.type in encryptedTypes and len(pkt.payload) > 0 and pkt.payload[0] == HC2C:
+                # If HC2C error marker present, just log it
+                if len(pkt.payload) >= 2 and pkt.payload[1] == 0xFF:
+                    reason = pkt.payload[2:].decode(errors='ignore')
+                    self.logger.error(f"[vnet] C2C handshake error from {int_to_ip(pkt.src_ip)}: {reason}")
+                    return None
                 self._handle_incoming_c2c_handshake(pkt)
                 return None  # Handshake packets are not returned to application
             
@@ -249,13 +269,23 @@ class Client:
             tunnel = self.tunnels.get(pkt.src_ip, None)
             
             if tunnel is not None and pkt.type in encryptedTypes:
-                try:
-                    decrypted_pkt = tunnel.decrypt(pkt)
-                    self.logger.debug(f"Decrypted C2C packet from {int_to_ip(pkt.src_ip)}")
-                    return decrypted_pkt
-                except Exception as e:
-                    self.logger.error(f"Decryption failed from {int_to_ip(pkt.src_ip)}: {e}")
-                    return None
+                # Heuristic: only attempt decrypt if payload looks like an authenticated frame
+                min_auth_len = MAC_SIZE + GCM_NONCE_SIZE + 16  # mac + nonce + tag + min ciphertext(0)
+                if len(pkt.payload) >= min_auth_len:
+                    try:
+                        decrypted_pkt = tunnel.decrypt(pkt)
+                        # success: reset short S2C counters for this peer
+                        self._reset_short_s2c(pkt.src_ip)
+                        self.logger.debug(f"Decrypted C2C packet from {int_to_ip(pkt.src_ip)}")
+                        return decrypted_pkt
+                    except Exception as e:
+                        self.logger.error(f"Decryption failed from {int_to_ip(pkt.src_ip)}: {e}")
+                        return None
+                else:
+                    # Payload is too short to be an encrypted+MAC frame; likely plaintext
+                    self.logger.warning(f"Received short S2C payload from {int_to_ip(pkt.src_ip)} while tunnel exists; treating as plaintext")
+                    self._record_short_s2c(pkt.src_ip)
+                    return pkt
 
             return pkt
 
@@ -269,11 +299,49 @@ class Client:
                 self.logger.error(f"[vnet] Unknown 'on_error' value: {on_error}")
                 raise PacketError("failed to receive packet: " + str(e))
             return None
+    
+    def _send_hc2c_error(self, dst_ip: int, reason: str):
+        """Send HC2C error frame to a peer via server routing.
+        Format: [HC2C(1)] [0xFF] [utf8 reason]
+        """
+        try:
+            payload = bytes([HC2C]) + bytes([0xFF]) + reason.encode()
+            pkt = Packet(S2C, payload, src_ip=self.vip_int, dst_ip=dst_ip)
+            self.sock.sendall(pkt.to_bytes())
+        except Exception as e:
+            self.logger.debug(f"Failed to send HC2C error to {int_to_ip(dst_ip)}: {e}")
+
+    def _record_short_s2c(self, src_ip: int):
+        now = time.time()
+        dq = self._short_s2c.get(src_ip)
+        if dq is None:
+            dq = deque()
+            self._short_s2c[src_ip] = dq
+        # append and prune older than window
+        dq.append(now)
+        window = self._short_s2c_window
+        while dq and now - dq[0] > window:
+            dq.popleft()
+        # Check threshold
+        if len(dq) >= self._short_s2c_threshold:
+            last = self._short_s2c_last_alert.get(src_ip, 0.0)
+            if now - last >= self._short_s2c_cooldown:
+                self._short_s2c_last_alert[src_ip] = now
+                ip_str = int_to_ip(src_ip)
+                self.logger.error(f"[vnet] Repeated plaintext frames from {ip_str} while tunnel exists (>= {self._short_s2c_threshold} in {int(self._short_s2c_window)}s). Suggest re-handshake.")
+                # Notify peer so it can reset handshake if needed
+                self._send_hc2c_error(src_ip, "Peer expects encrypted frames; please re-establish tunnel")
+
+    def _reset_short_s2c(self, src_ip: int):
+        self._short_s2c.pop(src_ip, None)
+        self._short_s2c_last_alert.pop(src_ip, None)
 
     def _handle_incoming_c2c_handshake(self, pkt: Packet):
         """Handle incoming C2C handshake from another client"""
         if pkt.src_ip in self.tunnels:
             self.logger.warning(f"C2C tunnel with {int_to_ip(pkt.src_ip)} already exists")
+            # Notify initiator that tunnel already exists
+            self._send_hc2c_error(pkt.src_ip, "C2C tunnel already exists")
             return
         
         # Detect handshake type by payload length
@@ -285,60 +353,68 @@ class Client:
             self._respond_legacy_handshake(pkt, payload)
         else:
             self.logger.error(f"Unknown handshake format from {int_to_ip(pkt.src_ip)}, length={len(payload)}")
+            self._send_hc2c_error(pkt.src_ip, f"Unknown handshake format (len={len(payload)})")
 
     def _respond_dh_handshake(self, pkt: Packet, payload: bytes):
         """Respond to Diffie-Hellman handshake request"""
         self.logger.info(f"[vnet] Responding to DH C2C handshake from {int_to_ip(pkt.src_ip)}")
         
-        # Parse incoming handshake
-        session_id = payload[:8]
-        timestamp = int.from_bytes(payload[8:16], 'big')
-        peer_public_bytes = payload[16:48]
-        
-        # Verify timestamp freshness
-        current_time = int(time.time())
-        if abs(current_time - timestamp) > 300:
-            self.logger.warning(f"[vnet] Old handshake timestamp: {current_time - timestamp}s")
-        
-        # Generate our key pair
-        private_key = x25519.X25519PrivateKey.generate()
-        public_key = private_key.public_key()
-        our_public_bytes = public_key.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
-        )
-        
-        # Compute shared secret
-        peer_public_key = x25519.X25519PublicKey.from_public_bytes(peer_public_bytes)
-        shared_secret = private_key.exchange(peer_public_key)
-        
-        # Generate our session ID
-        our_session_id = os.urandom(8)
-        our_timestamp = int(time.time()).to_bytes(8, 'big')
-        
-        # Send response
-        response_payload = bytes([HC2C]) + our_session_id + our_timestamp + our_public_bytes
-        response_pkt = Packet(S2C, response_payload, src_ip=self.vip_int, dst_ip=pkt.src_ip)
-        self.sock.sendall(response_pkt.to_bytes())
-        
-        # Derive keys
-        context_info = b'dosp-c2c-dh-v1' + session_id + our_session_id
-        keys = derive_tunnel_keys(shared_secret, info=context_info)
-        
-        # Create tunnel
-        tunnel = TunneledClient(
-            pkt.src_ip,
-            logger=self.logger,
-            sock=self.sock,
-            use_dh=True
-        )
-        tunnel.encryption_key = keys['encryption']
-        tunnel.mac_key = keys['mac']
-        tunnel.iv_material = keys['iv_material']
-        tunnel.encryption_completed = True
-        
-        self.tunnels[pkt.src_ip] = tunnel
-        self.logger.info(f"[vnet] ✓ DH C2C tunnel established (responder) with {int_to_ip(pkt.src_ip)}")
+        try:
+            # Parse incoming handshake
+            if len(payload) < 48:
+                raise HandshakeError("invalid DH handshake length")
+            session_id = payload[:8]
+            timestamp = int.from_bytes(payload[8:16], 'big')
+            peer_public_bytes = payload[16:48]
+            
+            # Verify timestamp freshness
+            current_time = int(time.time())
+            if abs(current_time - timestamp) > 300:
+                self.logger.warning(f"[vnet] Old handshake timestamp: {current_time - timestamp}s")
+            
+            # Generate our key pair
+            private_key = x25519.X25519PrivateKey.generate()
+            public_key = private_key.public_key()
+            our_public_bytes = public_key.public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw
+            )
+            
+            # Compute shared secret
+            peer_public_key = x25519.X25519PublicKey.from_public_bytes(peer_public_bytes)
+            shared_secret = private_key.exchange(peer_public_key)
+            
+            # Generate our session ID
+            our_session_id = os.urandom(8)
+            our_timestamp = int(time.time()).to_bytes(8, 'big')
+            
+            # Send response
+            response_payload = bytes([HC2C]) + our_session_id + our_timestamp + our_public_bytes
+            response_pkt = Packet(S2C, response_payload, src_ip=self.vip_int, dst_ip=pkt.src_ip)
+            self.sock.sendall(response_pkt.to_bytes())
+            
+            # Derive keys
+            context_info = b'dosp-c2c-dh-v1' + session_id + our_session_id
+            keys = derive_tunnel_keys(shared_secret, info=context_info)
+            
+            # Create tunnel
+            tunnel = TunneledClient(
+                pkt.src_ip,
+                logger=self.logger,
+                sock=self.sock,
+                use_dh=True
+            )
+            tunnel.encryption_key = keys['encryption']
+            tunnel.mac_key = keys['mac']
+            tunnel.iv_material = keys['iv_material']
+            tunnel.encryption_completed = True
+            
+            self.tunnels[pkt.src_ip] = tunnel
+            self.logger.info(f"[vnet] ✓ DH C2C tunnel established (responder) with {int_to_ip(pkt.src_ip)}")
+        except Exception as e:
+            self.logger.error(f"[vnet] Failed to respond to DH handshake from {int_to_ip(pkt.src_ip)}: {e}")
+            # notify initiator about failure
+            self._send_hc2c_error(pkt.src_ip, f"Responder handshake failure: {e}")
 
     def _respond_legacy_handshake(self, pkt: Packet, payload: bytes):
         """Respond to legacy handshake request"""

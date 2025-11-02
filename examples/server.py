@@ -1,4 +1,4 @@
-from vnet.server import DoSP
+from dosp.server import DoSP
 
 if __name__ == "__main__":
     server = DoSP()
