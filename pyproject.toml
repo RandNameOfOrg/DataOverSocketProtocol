@@ -5,9 +5,14 @@ description = "A DoSP (Data over Socket Protocol) client and server"
 authors = [{name = "daniil10295", email = "chernyak.daniil.2010@gmail.com"}]
 readme = "README.md"
 requires-python = ">=3.8"
+license = "MIT License"
+license-files = ["LICEN[CS]E*"]
 classifiers = [
+    #   3 - Alpha
+    #   4 - Beta
+    #   5 - Production/Stable
+    "Development Status :: 4 - Beta",
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
 dependencies = [
