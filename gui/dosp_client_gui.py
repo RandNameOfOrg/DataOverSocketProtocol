@@ -232,7 +232,8 @@ class DoSPGUIClient(ctk.CTk):
             threading.Thread(target=self.receive_loop, daemon=True).start()
             
         except Exception as e:
-            self.after(0, lambda: self._on_connection_failed(str(e)))
+            error = str(e) or "unknown error"
+            self.after(0, lambda: self._on_connection_failed(error))
     
     def _on_connected(self):
         """Called when connection succeeds"""
