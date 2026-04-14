@@ -460,7 +460,7 @@ class LocalClient(Client):
     """Client connected through another python process"""
 
     def __init__(self, server: DoSP, vip=None):
-        if not (server.running and server.config["allow_local"]):
+        if not (server.running and server.config.allow_local):
             raise HandshakeError("server is not running or allow_local is disabled")
 
         self.server = server

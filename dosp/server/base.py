@@ -2,6 +2,10 @@ import logging
 import socket
 import threading
 from hashlib import sha256
+
+import pydantic
+from pydantic import Field
+
 from dosp.protocol import *
 
 class RemoteServer:
@@ -38,20 +42,37 @@ class RemoteServer:
         offset += 1
         return RemoteServer(host, port, tmpl, hop_count=hop), offset
 
+class ServerConfig(pydantic.BaseModel):
+    host: str = Field(default="0.0.0.0")
+    port: int = 7744
+    ip_template: str = "7.10.0.x"
+    allow_local: bool = False
+    peers: list[dict] = []
+    remote_servers_limit: int = 64
+    max_hops: int = 8
+    banned_ip_list: list[int] = [ip_to_int("0.0.0.0"), ip_to_int("127.0.0.1")]
+    clients_conf: list = [
+        0x01, # Version
+        0x0000, # Server token (allows to determine what types after 0x1F is)
+    ]
+    logger_name: str | None = None
 
 class DoSP:
     running  = True
     dev_mode = False
+
     logger: logging.Logger = logging.getLogger(__name__)
     logger.setLevel(logging.DEBUG)
-    BANNED_IPs = [
-        ip_to_int("0.0.0.0"),
-        ip_to_int("127.0.0.1")
-    ]
+    thread = None
 
     # ---- Peer helpers ----
     @staticmethod
     def _ip_matches_template(ip_int: int, template: str) -> bool:
+        if "x" not in template:
+            return False
+        if "{x}" in template:
+            template = template.replace("{x}", "x")
+
         try:
             parts = template.split('.')
             if len(parts) != 4:
@@ -61,7 +82,7 @@ class DoSP:
                 return False
             ip_parts = ip_s.split('.')
             for i in range(4):
-                if parts[i] == '{x}':
+                if parts[i] == 'x':
                     continue
                 if parts[i] != ip_parts[i]:
                     return False
@@ -77,40 +98,30 @@ class DoSP:
             return ''
         return '.'.join(parts[:3]) + '.'
 
-    config = {
-        "host": "0.0.0.0",
-        "port": 7744,
-        "ip_template": "7.10.0.{x}",
-        "allow_local": False,
-        # List of peer servers: {host, port, ip_template}
-        "peers": [],
-        # Auto-distribution limits
-        "remoteServers_limit": 64,
-        # Max hops for chained forwarding (basic safeguard)
-        "max_hops": 8,
-        "clients_conf": [
-            0x01, # Version
-            0x0000, # Server token (allows to determine what types after 0x1F is)
-        ]
-    }
 
-    def __init__(self, host="0.0.0.0", port=7744,
-                 ip_template="7.10.0.{x}", allow_local = False, logger_name: str | None = None):
+    def __init__(self, config: ServerConfig | dict | None = None, **kwargs):
         """
         Basic DoSP server with functionality to process all packets and client connections.
-        :param host: host address
-        :param port: host port
-        :param ip_template: what vIPs should be used for clients
-        :param allow_local: allow connection from local scripts (if other scripts have access to this class)
         """
-        self.host = host
-        self.port = port
-        self.ip_template = ip_template
+        if config is None:
+            self.config = ServerConfig(**kwargs)
+        elif isinstance(config, dict):
+            self.config = ServerConfig(**(config | kwargs))
+        else:
+            self.config = config
+
+        if "{x}" in self.config.ip_template:
+            self.config.ip_template = self.config.ip_template.replace("{x}", "x")
+        
+        # Normalize existing peers in config
+        for peer in self.config.peers:
+            if "{x}" in peer.get("ip_template", ""):
+                peer["ip_template"] = peer["ip_template"].replace("{x}", "x")
 
         # Configure instance logger
         try:
-            if logger_name:
-                self.logger = logging.getLogger(logger_name)
+            if self.config.logger_name:
+                self.logger = logging.getLogger(self.config.logger_name)
         except Exception:
             pass
 
@@ -126,40 +137,41 @@ class DoSP:
         self.remote_servers: dict[str, RemoteServer] = {}  # ip_template -> RemoteServer metadata
         self.peer_retry_counts: list[int] = []  # retry counters per peer
 
-        self.allow_local = allow_local
-        self.server_ip = ip_to_int(self.ip_template.replace("{x}", "1"))
-        self.config = {
-            "host": self.host,
-            "port": self.port,
-            "ip_template": self.ip_template,
-            "allow_local": self.allow_local,
-            "peers": [],
-            "remoteServers_limit": DoSP.config.get("remoteServers_limit", 64),
-            "max_hops": DoSP.config.get("max_hops", 8),
-            "clients_conf": DoSP.config["clients_conf"],
-        }
+        self.server_ip = ip_to_int(self.config.ip_template.replace("x", "1"))
 
         # Registry for templates
         self.direct_templates: dict[str, int] = {}  # ip_template -> direct peer index
         self.learned_next_hops: dict[str, list[int]] = {}  # ip_template -> [peer_idx]
-        self.max_hops = self.config.get("max_hops", 8)
-        self.remote_limit = self.config.get("remoteServers_limit", 64)
+        
         # Forwarding loop-prevention TTL store: key -> remaining hops
         self._forward_ttl: dict[tuple[int, int], int] = {}  # (dst_ip, digest) -> ttl
 
     # ---- Peer management ----
-    def add_peer_server(self, host: str, port: int, ip_template: str) -> int:
+    def add_peer_server(self, host: str, port: int = 7744, ip_template: str | None = None) -> int:
         """
-        Add a peer server that serves a given ip_template, e.g. "66.11.5.{x}".
-        Returns peer index that can be used internally.
+        Add a peer server that serves a given ip_template, e.g. "66.11.5.x".
+        Returns peer index that can be used internally. Parses IP template from server if not set (NotImplemented)
         """
+        if ip_template is None:
+            # ToDo: Parses IP template from server if not set
+            raise NotImplementedError("ip_template must be set")
+        
+        if "{x}" in ip_template:
+            ip_template = ip_template.replace("{x}", "x")
+
+        # Avoid duplicates
+        for idx, p in enumerate(self.peers):
+            if p["host"] == host and p["port"] == int(port) and p["ip_template"] == ip_template:
+                return idx
+
         peer = {"host": host, "port": int(port), "ip_template": ip_template}
         self.peers.append(peer)
         self.peer_socks.append(None)
         self.peer_locks.append(threading.Lock())
         self.peer_retry_counts.append(0)
         # Keep config in sync
-        self.config.setdefault("peers", []).append(peer)
+        if peer not in self.config.peers:
+            self.config.peers.append(peer)
         # Register as direct template owner (manual add has priority; collision: keep first)
         if ip_template not in self.direct_templates:
             idx = len(self.peers) - 1
@@ -322,7 +334,7 @@ class DoSP:
             return 0
 
     def _ttl_left(self, dst_ip: int, digest: int) -> int:
-        return self._forward_ttl.get((dst_ip, digest), self.max_hops)
+        return self._forward_ttl.get((dst_ip, digest), self.config.max_hops)
 
     def _decrement_ttl(self, dst_ip: int, digest: int) -> int:
         left = self._ttl_left(dst_ip, digest)
@@ -416,7 +428,7 @@ class DoSP:
                 if tmpl in self.direct_templates or tmpl in self.learned_next_hops:
                     continue
                 # If hop_count==0, sender claims ownership. If capacity allows, register direct via sender peer.
-                if rs.hop_count == 0 and len(self.direct_templates) < self.remote_limit:
+                if rs.hop_count == 0 and len(self.direct_templates) < self.config.remote_servers_limit:
                     self.direct_templates[tmpl] = sender_idx
                     # Track metadata
                     self.remote_servers[tmpl] = RemoteServer(self.peers[sender_idx]["host"], int(self.peers[sender_idx]["port"]), tmpl, hop_count=0, source_peer_idx=sender_idx)
@@ -454,17 +466,22 @@ class DoSP:
             ip_num = 2
             while True:
                 if ip_num not in self.assigned_ids:
-                    ip_str = self.ip_template.replace("{x}", str(ip_num))
+                    ip_str = self.config.ip_template.replace("x", str(ip_num))
                     ip_int = ip_to_int(ip_str)
                     if ip_int not in self.clients:
                         self.assigned_ids.add(ip_num)
                         return ip_int, ip_num
                 ip_num += 1
 
-    def start(self):
+    def start(self, detach: bool = False) -> threading.Thread | None:
+        """
+        Start server socket.
+        :param detach: Run as Thread or not (if False locks code execution).
+        :return: Thread if detach else None
+        """
         # Initialize configured peers
         try:
-            for peer in self.config.get("peers", []) or []:
+            for peer in list(self.config.peers):
                 try:
                     self.add_peer_server(peer["host"], peer["port"], peer["ip_template"]) 
                 except Exception as e:
@@ -472,19 +489,32 @@ class DoSP:
         except Exception as e:
             self.logger.error(f"Peer init error: {e}")
 
-        self.sock.bind((self.host, self.port))
-        self.sock.listen()
-        self.logger.info(f"Server listening on {self.host}:{self.port}")
-        while self.running:
-            try:
-                client_sock, addr = self.sock.accept()
-                threading.Thread(target=self.handle_client, args=(client_sock,), daemon=True).start()
-            except KeyboardInterrupt:
-                self.logger.info("Server stopped by user")
-                self.stop()
-                break
-            except Exception as e:
-                self.logger.error(f"Accept error: {e}")
+        def bind() -> None:
+            self.sock.bind((self.config.host, self.config.port))
+            self.sock.listen()
+            self.logger.info(f"Server listening on {self.config.host}:{self.config.port}")
+            while self.running:
+                try:
+                    client_sock, addr = self.sock.accept()
+                    threading.Thread(target=self.handle_client, args=(client_sock,), daemon=True).start()
+                except KeyboardInterrupt:
+                    self.logger.info("Server stopped by user")
+                    self.stop()
+                    break
+                except Exception as e:
+                    self.logger.error(f"Accept error: {e}")
+
+        if not detach:
+            bind()
+            return None
+
+        if self.thread and self.thread.is_alive():
+            return self.thread
+
+        self.thread = threading.Thread(target=bind, daemon=True)
+        self.thread.start()
+        return self.thread
+
 
     def stop(self):
         """sends a close packet to all clients and stops the server"""
@@ -550,7 +580,7 @@ class DoSP:
         self.logger.info(f"Client connected: {int_to_ip(ip_int)}")
         if sock is not None:
             pkt_aip = Packet(AIP, ip_int.to_bytes(4, 'big'))
-            pkt_hsk = Packet(HSK, str(self.config["clients_conf"]).encode())
+            pkt_hsk = Packet(HSK, str(self.config.clients_conf).encode())
             try:
                 sock.sendall(pkt_aip.to_bytes())
                 sock.sendall(pkt_hsk.to_bytes())
@@ -559,7 +589,7 @@ class DoSP:
 
     def local_connect(self, client):
         """Connects a local client to the server without using sockets"""
-        if not (self.running and self.allow_local):
+        if not (self.running and self.config.allow_local):
             raise HandshakeError("server is not running or allow_local is disabled")
 
         ip_int, ip_id = self._next_ip()
@@ -634,7 +664,7 @@ class DoSP:
         elif pkt.type == RQIP:
             new_ip = int.from_bytes(pkt.payload, 'big')
             self.logger.debug(f"[{int_to_ip(ip_int)}] Requesting IP {int_to_ip(new_ip)}")
-            if new_ip in self.BANNED_IPs:
+            if new_ip in self.config.banned_ip_list:
                 self.logger.warning(f"IP {int_to_ip(new_ip)} is in block list")
                 sock.sendall(Packet(RQIP, b"E:IP can't be used").to_bytes())
                 return

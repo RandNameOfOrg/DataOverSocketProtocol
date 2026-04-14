@@ -2,7 +2,7 @@
 ![PyPI - Version](https://img.shields.io/pypi/v/DoSP)
 ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/RandNameOfOrg/DataOverSocketProtocol/python-publish.yml)
 
-**DoSP** (Default or Simple Protocol) — TCP-протокол, работающий по умолчанию на порту `7744`. Используется для маршрутизации и пересылки сообщений между клиентами через центральный сервер.
+**DoSP** (Data over socket Protocol) — TCP-протокол, работающий по умолчанию на порту `7744`. Используется для маршрутизации и пересылки сообщений между клиентами через центральный сервер.
 
 ---
 
@@ -62,8 +62,10 @@ other types are reserved for future use
 ```python
 import dosp.server as dosp_server
 server = dosp_server.DoSP(ip_template="10.0.0.{x}")
-server.start()
+server.start() # <- will lock execution by defualt
 ```
+
+To start server 
 
 Клиенты получат IP вида `10.0.0.2`, `10.0.0.3`, …
 
