@@ -7,6 +7,7 @@ import pydantic
 from pydantic import Field
 
 from dosp.protocol import *
+from dosp.iptools import ip_to_int, int_to_ip
 
 class RemoteServer:
     def __init__(self, host: str, port: int, ip_template: str, hop_count: int = 0, source_peer_idx: int | None = None):
@@ -22,7 +23,8 @@ class RemoteServer:
     def to_bytes(self) -> bytes:
         host_b = self.host.encode()
         tmpl_b = self.ip_template.encode()
-        return bytes([len(host_b)]) + host_b + self.port.to_bytes(2, 'big') + bytes([len(tmpl_b)]) + tmpl_b + bytes([self.hop_count & 0xFF])
+        return bytes([len(host_b)]) + host_b + self.port.to_bytes(2, 'big') + bytes([len(tmpl_b)]) + tmpl_b + bytes(
+            [self.hop_count & 0xFF])
 
     @staticmethod
     def from_bytes(buf: bytes, offset: int = 0) -> tuple['RemoteServer', int]:
@@ -30,17 +32,18 @@ class RemoteServer:
             raise ValueError("buffer underflow")
         hl = buf[offset]
         offset += 1
-        host = buf[offset:offset+hl].decode()
+        host = buf[offset:offset + hl].decode()
         offset += hl
-        port = int.from_bytes(buf[offset:offset+2], 'big')
+        port = int.from_bytes(buf[offset:offset + 2], 'big')
         offset += 2
         tl = buf[offset]
         offset += 1
-        tmpl = buf[offset:offset+tl].decode()
+        tmpl = buf[offset:offset + tl].decode()
         offset += tl
         hop = buf[offset] if offset < len(buf) else 0
         offset += 1
         return RemoteServer(host, port, tmpl, hop_count=hop), offset
+
 
 class ServerConfig(pydantic.BaseModel):
     host: str = Field(default="0.0.0.0")
@@ -52,13 +55,14 @@ class ServerConfig(pydantic.BaseModel):
     max_hops: int = 8
     banned_ip_list: list[int] = [ip_to_int("0.0.0.0"), ip_to_int("127.0.0.1")]
     clients_conf: list = [
-        0x01, # Version
-        0x0000, # Server token (allows to determine what types after 0x1F is)
+        0x01,  # Version
+        0x0000,  # Server token (allows to determine what types after 0x1F is)
     ]
     logger_name: str | None = None
 
+
 class DoSP:
-    running  = True
+    running = True
     dev_mode = False
 
     logger: logging.Logger = logging.getLogger(__name__)
@@ -98,7 +102,6 @@ class DoSP:
             return ''
         return '.'.join(parts[:3]) + '.'
 
-
     def __init__(self, config: ServerConfig | dict | None = None, **kwargs):
         """
         Basic DoSP server with functionality to process all packets and client connections.
@@ -112,7 +115,7 @@ class DoSP:
 
         if "{x}" in self.config.ip_template:
             self.config.ip_template = self.config.ip_template.replace("{x}", "x")
-        
+
         # Normalize existing peers in config
         for peer in self.config.peers:
             if "{x}" in peer.get("ip_template", ""):
@@ -142,7 +145,7 @@ class DoSP:
         # Registry for templates
         self.direct_templates: dict[str, int] = {}  # ip_template -> direct peer index
         self.learned_next_hops: dict[str, list[int]] = {}  # ip_template -> [peer_idx]
-        
+
         # Forwarding loop-prevention TTL store: key -> remaining hops
         self._forward_ttl: dict[tuple[int, int], int] = {}  # (dst_ip, digest) -> ttl
 
@@ -155,7 +158,7 @@ class DoSP:
         if ip_template is None:
             # ToDo: Parses IP template from server if not set
             raise NotImplementedError("ip_template must be set")
-        
+
         if "{x}" in ip_template:
             ip_template = ip_template.replace("{x}", "x")
 
@@ -360,9 +363,11 @@ class DoSP:
                     psock.sendall(Packet(S2C, payload, dst_ip=dst_ip, src_ip=src_ip).to_bytes())
                 self._decrement_ttl(dst_ip, digest)
                 try:
-                    self.logger.info(f"FWD S2C peer[{peer_idx}] {int_to_ip(src_ip)} -> {int_to_ip(dst_ip)} (ttl {self._ttl_left(dst_ip, digest)})")
+                    self.logger.info(
+                        f"FWD S2C peer[{peer_idx}] {int_to_ip(src_ip)} -> {int_to_ip(dst_ip)} (ttl {self._ttl_left(dst_ip, digest)})")
                 except Exception:
-                    self.logger.info(f"FWD S2C peer[{peer_idx}] -> {int_to_ip(dst_ip)} (ttl {self._ttl_left(dst_ip, digest)})")
+                    self.logger.info(
+                        f"FWD S2C peer[{peer_idx}] -> {int_to_ip(dst_ip)} (ttl {self._ttl_left(dst_ip, digest)})")
                 return True
             except Exception as e:
                 self.logger.error(f"Peer[{peer_idx}] send failed: {e}")
@@ -431,14 +436,18 @@ class DoSP:
                 if rs.hop_count == 0 and len(self.direct_templates) < self.config.remote_servers_limit:
                     self.direct_templates[tmpl] = sender_idx
                     # Track metadata
-                    self.remote_servers[tmpl] = RemoteServer(self.peers[sender_idx]["host"], int(self.peers[sender_idx]["port"]), tmpl, hop_count=0, source_peer_idx=sender_idx)
+                    self.remote_servers[tmpl] = RemoteServer(self.peers[sender_idx]["host"],
+                                                             int(self.peers[sender_idx]["port"]), tmpl, hop_count=0,
+                                                             source_peer_idx=sender_idx)
                     self.logger.info(f"Learned direct owner for {tmpl} via peer[{sender_idx}]")
                     continue
                 # Otherwise store as learned next-hop (chain via sender)
                 self.learned_next_hops.setdefault(tmpl, [])
                 if sender_idx not in self.learned_next_hops[tmpl]:
                     self.learned_next_hops[tmpl].append(sender_idx)
-                    self.remote_servers[tmpl] = RemoteServer(self.peers[sender_idx]["host"], int(self.peers[sender_idx]["port"]), tmpl, hop_count=rs.hop_count + 1, source_peer_idx=sender_idx)
+                    self.remote_servers[tmpl] = RemoteServer(self.peers[sender_idx]["host"],
+                                                             int(self.peers[sender_idx]["port"]), tmpl,
+                                                             hop_count=rs.hop_count + 1, source_peer_idx=sender_idx)
                     self.logger.debug(f"Learned next-hop for {tmpl} via peer[{sender_idx}] (hop {rs.hop_count + 1})")
         except Exception as e:
             self.logger.debug(f"Advertisement parse error from peer[{sender_idx}]: {e}")
@@ -483,7 +492,7 @@ class DoSP:
         try:
             for peer in list(self.config.peers):
                 try:
-                    self.add_peer_server(peer["host"], peer["port"], peer["ip_template"]) 
+                    self.add_peer_server(peer["host"], peer["port"], peer["ip_template"])
                 except Exception as e:
                     self.logger.error(f"Failed to add peer {peer}: {e}")
         except Exception as e:
@@ -514,7 +523,6 @@ class DoSP:
         self.thread = threading.Thread(target=bind, daemon=True)
         self.thread.start()
         return self.thread
-
 
     def stop(self):
         """sends a close packet to all clients and stops the server"""
@@ -588,7 +596,7 @@ class DoSP:
                 self.logger.error(f"Failed to send IP or config to {int_to_ip(ip_int)}: {e}")
 
     def local_connect(self, client):
-        """Connects a local client to the server without using sockets"""
+        """Connects a local client to the server without using sockets. WIP"""
         if not (self.running and self.config.allow_local):
             raise HandshakeError("server is not running or allow_local is disabled")
 
@@ -614,9 +622,12 @@ class DoSP:
 
     def handle_packet(self, pkt: Packet, sock: socket.socket, ip_int: int):
         src_ip = pkt.src_ip or ip_int
+        # print("Size of packet:", pkt.size())
 
         if pkt.type == MSG:
-            self.logger.info(f"[MSG] {int_to_ip(ip_int)}: {pkt.payload.decode(errors='ignore')}")
+            message = pkt.payload.decode(errors='ignore')
+            if not message.startswith("%&DL}"): # Dont Log
+                self.logger.info(f"[MSG] {int_to_ip(ip_int)}: {message}")
         elif pkt.type == EXIT:
             # TODO: Make it good
             pass
@@ -679,13 +690,14 @@ class DoSP:
                     client_sock = self.clients.pop(ip_int, None)
                     self.clients[new_ip] = client_sock
                     self.assigned_ids.add(new_ip)
+                # send client success
             except Exception as e:
                 print("Failed to rewrite client id:", e)
             finally:
                 self.on_disconnect(new_ip)
             sock.sendall(Packet(RQIP, b"D:").to_bytes())
             sock.sendall(Packet(AIP, new_ip.to_bytes(4, 'big')).to_bytes())
-            self.logger.debug(f"{int_to_ip(ip_int)}] got new vIP {int_to_ip(new_ip)}")
+            self.logger.debug(f"[{int_to_ip(ip_int)}] got new vIP {int_to_ip(new_ip)}")
         else:
             self.logger.warning(f"Unknown packet type {hex(pkt.type)} from {int_to_ip(ip_int)}")
             sock.sendall(Packet(ERR, bytes(int(ERR_CODES.UKNP))).to_bytes())

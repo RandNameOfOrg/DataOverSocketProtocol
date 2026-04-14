@@ -13,7 +13,7 @@ if __name__ == "__main__":
     ))
     try:
         server.start()
-        server.add_peer_server("10.0.0.50", ip_template="7.10.0.{x}")
+        # server.add_peer_server("10.0.0.50", ip_template="7.10.0.{x}")
     except KeyboardInterrupt:
         server.stop()
         exit(0)

@@ -6,6 +6,7 @@ from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives import serialization
 
 from .server import DoSP
+from .iptools import int_to_ip, ip_to_int
 
 
 class Client:

@@ -2,12 +2,13 @@ import os
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dosp.client import Client
+from dosp.iptools import ip_to_int, int_to_ip
 from dosp.protocol import *
 import threading
 
 
 class InteractiveMessageClient:
-    def __init__(self, server_ip="main.hosts.daniil10295.ru", vip="7.10.0.1"):
+    def __init__(self, server_ip="main.hosts.daniil10295.ru", vip=None):
         self.server_ip = server_ip
         self.vip = vip
         self.client: Client | None = None
@@ -15,9 +16,9 @@ class InteractiveMessageClient:
         self.target_ip = None
 
     def connect(self):
-        """Подключение к серверу"""
+        # """Подключение к серверу"""
         try:
-            self.client = Client(host=self.server_ip, vip=self.vip, fixed_vip=True)
+            self.client = Client(host=self.server_ip, vip=self.vip, fixed_vip=False)
             print(f"✅ Connected to {self.server_ip}")
             print(f"📍 Your vIP: {int_to_ip(self.client.vip_int) or 'unknown'}")
             return True
@@ -48,7 +49,7 @@ class InteractiveMessageClient:
             else:
                 self.target_ip = ip_to_int(ip_str)
                 print(f"🎯 Target set: {ip_str}")
-        except:
+        except ValueError:
             print("❌ Invalid IP format. Use '7.10.0.2' or 'server'")
 
     def request_clients(self):
@@ -60,7 +61,8 @@ class InteractiveMessageClient:
         except Exception as e:
             print(f"❌ Request clients error: {e}")
 
-    def show_help(self):
+    @staticmethod
+    def show_help():
         """Показать справку по командам"""
         print("\n📖 Available commands:")
         print("  /help - Show this help")
