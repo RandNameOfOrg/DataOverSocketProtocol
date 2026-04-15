@@ -104,11 +104,6 @@ TunneledClient(ip: int, logger: logging.Logger,
 **Methods**:
 
 ```python
-complete_key_exchange(second_key_part: bytes)
-```
-Complete legacy key exchange (use only for backward compatibility).
-
-```python
 send(pkt: Packet) -> None
 ```
 Send authenticated encrypted packet.
@@ -207,7 +202,7 @@ Convert integer to IP string.
 
 **Example**:
 ```python
-from dosp.protocol import ip_to_int, int_to_ip
+from dosp.iptools import ip_to_int, int_to_ip
 
 ip_int = ip_to_int("7.10.0.5")  # Returns integer
 ip_str = int_to_ip(ip_int)       # Returns "7.10.0.5"
@@ -311,7 +306,7 @@ do_c2c_handshake(c2c_vip: str | int, use_dh: bool = True) -> None
 ```
 Establish encrypted tunnel with another client.
 - `c2c_vip`: Target client's virtual IP
-- `use_dh`: Use Diffie-Hellman (recommended) vs legacy mode
+- `use_dh`: Use Diffie-Hellman (recommended) vs legacy mode (unsupported by new version)
 
 ```python
 close() -> None

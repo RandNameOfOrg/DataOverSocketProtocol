@@ -18,13 +18,18 @@ class Client:
     sock: socket.socket
     running: bool
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 7744, vip = None, fixed_vip = False, client_id: int | None = None):
+    def __init__(self,
+                 host: str = "127.0.0.1",
+                 port: int = 7744,
+                 vip = None, fixed_vip = False, client_id: int | None = None,
+                 require_compression = True):
         """
         Client constructor for DoS Protocol
         :param host: DoSP server host (or host:port)
         :param port: DoSP server port
         :param vip: what vIP will be requested
         :param fixed_vip: close connection if requested vIP can not be assigned
+        :param require_compression: whether to require compression, drops connection if server does not support it
         """
         if ":" in host:
             try:
@@ -39,16 +44,20 @@ class Client:
         self._short_s2c_threshold = 10   # events
         self._short_s2c_window = 60.0    # seconds
         self._short_s2c_cooldown = 60.0  # seconds
-        self.initializate_connection(host, port, vip=vip, fixed_vip=fixed_vip)
+        self.initializate_connection(host, port, vip=vip, fixed_vip=fixed_vip, req_compress=require_compression)
 
         self.logger.level = logging.INFO
 
-    def initializate_connection(self, host: str = "127.0.0.1", port: int = 7744, vip = None, fixed_vip = False):
-        self.sock = socket.create_connection((host, port))
-        self.do_handshake(vip=vip, cancel_on_RQIP_err=fixed_vip)
+    def initializate_connection(self,
+                                host: str = "127.0.0.1",
+                                port: int = 7744,
+                                vip = None, fixed_vip = False, socket_params: dict = None, **kwargs):
+        self.sock = socket.create_connection((host, port), **(socket_params or {}))
+        self.do_handshake(vip=vip, cancel_on_RQIP_err=fixed_vip, **kwargs)
         self.running = True
 
-    def do_handshake(self, vip = None, cancel_on_RQIP_err = False):
+    def do_handshake(self, vip = None,
+                     cancel_on_RQIP_err = False, req_compress=False):
         """Receive vIP and vnet config and request if needed"""
         pkt = Packet.from_socket(self.sock)
         if pkt.type != AIP:
@@ -57,11 +66,18 @@ class Client:
         self.logger.info(f"[vnet] Virtual IP: {int_to_ip(self.vip_int)}")
         pkt = Packet.from_socket(self.sock)
         if pkt.type == HSK:
-            self.config = eval(pkt.payload.decode())
+            decoded = pkt.payload.decode()
+            self.config = eval(decoded[1:])
+            enable_compression = decoded[0]
             version = self.config[0]
             server_token = self.config[1]
             self.logger.info(f"[vnet] vnet version: {version}")
             self.logger.info(f"[vnet] vnet server token: {server_token}")
+            self.logger.info(f"[vnet] Compression status: {enable_compression}")
+            if req_compress and int(enable_compression) != 1:
+                self.logger.error(f"[vnet] Compression required, but not enabled on the server. Dropping conn")
+                self.close("Compression required")
+                return
 
         if not vip: return
 
@@ -104,7 +120,7 @@ class Client:
         c2c_vip = ip_to_int(c2c_vip) if isinstance(c2c_vip, str) else c2c_vip
 
         if not c2c_vip:
-            raise HandshakeError("c2c_vip not provided")
+            raise HandshakeError("c2c virtual ip not provided")
 
         if use_dh:
             self._do_dh_c2c_handshake(c2c_vip)
@@ -189,13 +205,18 @@ class Client:
         self.logger.info(f"[vnet] ✓ Secure DH C2C tunnel established with {int_to_ip(c2c_vip)}")
         self.logger.debug(f"[vnet] Session: {session_id.hex()}, Keys derived, MAC enabled")
 
-    def _do_legacy_c2c_handshake(self, c2c_vip: int):
+    def _do_legacy_c2c_handshake(self,
+                                 c2c_vip: int,
+                                 raise_on_error: bool = True) -> 'Packet | None':
         """
         Legacy C2C handshake (LESS SECURE - for backward compatibility).
         Keys are sent through the server in plaintext - server can intercept!
         Use DH-based handshake instead for production.
+        :raises HandshakeError:
+        :raises PacketError:
+        :raises VNetError:
         """
-        self.logger.warning(f"[vnet] Using LEGACY C2C handshake (not recommended for production)")
+        self.logger.warning(f"[vnet] Using LEGACY C2C handshake (discontinued)")
         
         # C1(create key) send key -> C2()
         key = os.urandom(16)
@@ -203,9 +224,17 @@ class Client:
         self.sock.sendall(pkt.to_bytes())
 
         # Wait for 2nd key part
-        pkt = Packet.from_socket(self.sock, raise_on_error=True)
+        pkt = Packet.from_socket(self.sock, raise_on_error=raise_on_error)
         if pkt.type not in encryptedTypes or len(pkt.payload) < 1 or pkt.payload[0] != HC2C:
-            raise HandshakeError("failed to start legacy c2c handshake")
+            # if starts with E:
+            payload = pkt.payload.decode()
+            reason = "no reason"
+            if payload.startswith("E:"):
+                reason = payload[2:]
+
+            if raise_on_error:
+                raise HandshakeError(f"failed to start legacy c2c handshake, reason: {reason}")
+            self.logger.error(f"Legacy handshake failed, reason: {reason}")
         
         key2 = pkt.payload[1:]
         if len(key2) != 16:
@@ -351,7 +380,11 @@ class Client:
         if len(payload) >= 48:  # DH handshake: session_id(8) + timestamp(8) + public_key(32) = 48
             self._respond_dh_handshake(pkt, payload)
         elif len(payload) == 16:  # Legacy handshake: just 16 bytes key
-            self._respond_legacy_handshake(pkt, payload)
+            self.logger.warning(f"[vnet] cant make LEGACY C2C handshake (from {int_to_ip(pkt.src_ip)}), sending error")
+
+            # Generate our key part
+            response_pkt = Packet(S2C, b"E:NotSupported", src_ip=self.vip_int, dst_ip=pkt.src_ip)
+            self.sock.sendall(response_pkt.to_bytes())
         else:
             self.logger.error(f"Unknown handshake format from {int_to_ip(pkt.src_ip)}, length={len(payload)}")
             self._send_hc2c_error(pkt.src_ip, f"Unknown handshake format (len={len(payload)})")
@@ -417,29 +450,6 @@ class Client:
             # notify initiator about failure
             self._send_hc2c_error(pkt.src_ip, f"Responder handshake failure: {e}")
 
-    def _respond_legacy_handshake(self, pkt: Packet, payload: bytes):
-        """Respond to legacy handshake request"""
-        self.logger.warning(f"[vnet] Responding to LEGACY C2C handshake from {int_to_ip(pkt.src_ip)}")
-        
-        # Generate our key part
-        key2 = os.urandom(16)
-        response_pkt = Packet(S2C, bytes([HC2C]) + key2, src_ip=self.vip_int, dst_ip=pkt.src_ip)
-        self.sock.sendall(response_pkt.to_bytes())
-        
-        # Create tunnel
-        key1 = payload  # First key part from initiator
-        shared_secret = key1 + key2
-        tunnel = TunneledClient(
-            pkt.src_ip, 
-            logger=self.logger, 
-            encryption_key=shared_secret, 
-            sock=self.sock,
-            use_dh=False
-        )
-        
-        self.tunnels[pkt.src_ip] = tunnel
-        self.logger.info(f"[vnet] Legacy C2C tunnel established (responder) with {int_to_ip(pkt.src_ip)}")
-
     def check_connection(self):
         if not self.sock:
             self.logger.warning("vnet connection not established")
@@ -448,9 +458,10 @@ class Client:
 
         return True
 
-    def close(self):
+    def close(self, reason=""):
         self.logger.info(f"[vnet] closing connection")
         self.running = False
+        payload = b"CC," + reason.encode()
         try:
             self.sock.sendall(Packet(EXIT, payload=b"CC").to_bytes())
         except Exception:
@@ -476,6 +487,7 @@ class LocalClient(Client):
                 self.server.handle_packet(pkt, None, self.vip_int)
             except Exception as e:
                 self.logger.error(f"Failed to request IP: {e}")
+        super().__init__(vip)
 
     def send(self, pkt: Packet, on_error=None):
         pkt.src_ip = self.vip_int

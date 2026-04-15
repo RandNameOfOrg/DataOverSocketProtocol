@@ -2,7 +2,7 @@
 
 ## Protocol Version
 
-**Version**: 0.1.2  
+**Version**: 0.1.3 (DOCS NOT FULLY PORTED)  
 **Default Port**: 7744  
 **Transport**: TCP
 
@@ -115,29 +115,6 @@ Client A                 Server                 Client B
 [HC2C marker (1)] + [session_id (8)] + [timestamp (8)] + [X25519 public key (32)]
 ```
 
-#### Legacy Mode
-
-```
-Client A                 Server                 Client B
-  |                        |                        |
-  |------ S2C: HC2C ------>|                        |
-  |     key1 (16)          |                        |
-  |                        |------ S2C: HC2C ------>|
-  |                        |  (forwarded)           |
-  |                        |                        |
-  |                        |<----- S2C: HC2C ------|
-  |                        |     key2 (16)          |
-  |<----- S2C: HC2C -------|                        |
-  | (forwarded)            |                        |
-  |                        |                        |
-  [Combined key: key1+key2]                        [Combined key: key1+key2]
-```
-
-**Payload Format**:
-```
-[HC2C marker (1)] + [random key (16)]
-```
-
 ## Encrypted Messages
 
 ### C2C Tunnel Format
@@ -188,7 +165,7 @@ iv_material = key_material[64:96]     # Reserved
 
 Virtual IPs follow a template pattern:
 ```
-"{a}.{b}.{c}.{x}"
+"a.b.c.x"
 ```
 
 Where `{x}` is replaced by auto-incremented values starting from 2.

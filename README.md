@@ -47,11 +47,11 @@ other types are reserved for future use
 
 Каждому клиенту сервер присваивает виртуальный IPv4-адрес по шаблону:
 
-`"7.10.0.{x}"  # x начинается с 2`
+`"7.10.0.x"  # x начинается с 2`
 
 * Адрес назначается при подключении (`AIP`)
 * Используется для маршрутизации в `S2C`
-* IP может быть задан как `10.0.0.{x}`, `192.168.1.{x}` и т.д.
+* IP может быть задан как `10.0.0.x`, `192.168.1.x` и т.д.
 
 ---
 
@@ -61,7 +61,7 @@ other types are reserved for future use
 
 ```python
 import dosp.server as dosp_server
-server = dosp_server.DoSP(ip_template="10.0.0.{x}")
+server = dosp_server.DoSP(ip_template="10.0.0.x")
 server.start() # <- will lock execution by defualt
 ```
 
@@ -70,12 +70,14 @@ To start server
 Клиенты получат IP вида `10.0.0.2`, `10.0.0.3`, …
 
 ---
+## Credits
 
-## Interactive Client (IMC)
-Interactive Message Client is client (made by [__themaster1970sf__](https://github.com/themaster1970sf)) allows to send messages to server and other clients, for full command list type `/help` after starting client 
-
+### Interactive Client (IMC)
+Interactive Message Client is client (made by [__themaster1970sf__](https://github.com/themaster1970sf)), partly rewritten
 ---
 
 ## TODO
 
-- \[X] allow `SD` (Save/Load data) in server (Not planned anymore)
+- Make EXIT work fine on both client and server
+- make check_conection() working at client.py
+- add ip parsing at base.py (server)

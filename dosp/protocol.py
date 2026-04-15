@@ -226,6 +226,10 @@ class Packet:
 
     @staticmethod
     def from_socket(sock, src_ip: int = None, raise_on_error: bool = False, encryption_key=None) -> 'Packet | None':
+        """
+        :raises PacketError
+        :raises VNetError
+        """
         header = recv_exact(sock, 5)
         if not header:
             if raise_on_error:
@@ -339,39 +343,16 @@ class TunneledClient(IClient):
 
         # Legacy support: if encryption_key provided, use it directly
         if encryption_key is not None:
-            if len(encryption_key) == 32:
-                # New format: derive keys from shared secret
-                keys = derive_tunnel_keys(encryption_key)
-                self.encryption_key = keys['encryption']
-                self.mac_key = keys['mac']
-                self.iv_material = keys['iv_material']
-                self.encryption_completed = True
-            elif len(encryption_key) == 16:
-                # Old format: partial key (waiting for second half)
-                self.encryption_key = encryption_key
-                self.encryption_completed = False
-            else:
+            if len(encryption_key) != 32:
                 raise ValueError(f"Invalid encryption key length: {len(encryption_key)}")
-        else:
-            self.encryption_completed = False
-
-    def complete_key_exchange(self, second_key_part: bytes):
-        """Complete the legacy key exchange by combining both parts"""
-        if self.encryption_completed:
-            self.logger.warning("Key exchange already completed")
-            return
-
-        if len(self.encryption_key) == 16 and len(second_key_part) == 16:
-            # Combine keys and derive session keys
-            shared_secret = self.encryption_key + second_key_part
-            keys = derive_tunnel_keys(shared_secret)
-
+            # New format: derive keys from shared secret
+            keys = derive_tunnel_keys(encryption_key)
             self.encryption_key = keys['encryption']
             self.mac_key = keys['mac']
             self.iv_material = keys['iv_material']
             self.encryption_completed = True
-
-            self.logger.info(f"C2C tunnel keys derived for {int_to_ip(self.ip)}")
+        else:
+            self.encryption_completed = False
 
     def __repr__(self):
         status = "completed" if self.encryption_completed else "pending"

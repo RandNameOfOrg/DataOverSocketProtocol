@@ -49,13 +49,15 @@ class ServerConfig(pydantic.BaseModel):
     host: str = Field(default="0.0.0.0")
     port: int = 7744
     ip_template: str = "7.10.0.x"
+
     allow_local: bool = False
+    allow_compression: bool = ENABLE_COMPRESSION
     peers: list[dict] = []
     remote_servers_limit: int = 64
     max_hops: int = 8
     banned_ip_list: list[int] = [ip_to_int("0.0.0.0"), ip_to_int("127.0.0.1")]
     clients_conf: list = [
-        0x01,  # Version
+        0x02,  # Version
         0x0000,  # Server token (allows to determine what types after 0x1F is)
     ]
     logger_name: str | None = None
@@ -588,7 +590,7 @@ class DoSP:
         self.logger.info(f"Client connected: {int_to_ip(ip_int)}")
         if sock is not None:
             pkt_aip = Packet(AIP, ip_int.to_bytes(4, 'big'))
-            pkt_hsk = Packet(HSK, str(self.config.clients_conf).encode())
+            pkt_hsk = Packet(HSK, self.config.allow_compression.to_bytes() + str(self.config.clients_conf).encode())
             try:
                 sock.sendall(pkt_aip.to_bytes())
                 sock.sendall(pkt_hsk.to_bytes())
@@ -613,8 +615,23 @@ class DoSP:
                 self.assigned_ids.discard(ip_id)
             raise HandshakeError("local connection failed")
 
-    def on_disconnect(self, ip_int: int):
+    def on_disconnect(self, ip_int: int, code: str = "", reason: str = None):
         self.logger.info(f"Client disconnected: {int_to_ip(ip_int)}")
+        match code.encode():
+            case ClientExitCodes.ClientClosed:
+                code = "Just exited"
+            case ClientExitCodes.ProcessExit:
+                code = "ProcessExit"
+            case ClientExitCodes.UnexpectedError:
+                code = "UnexpectedError"
+            case "":
+                code = "No code provided"
+            case _:
+                code = "unknown code"
+        if reason:
+            self.logger.info(f"Client {int_to_ip(ip_int)} disconnected: {reason} ({code})")
+        else:
+            self.logger.info(f"Client {int_to_ip(ip_int)} disconnected: {code}")
 
     def on_function(self, function_name: str, ip_int: int) -> tuple[bool, str]:
         self.logger.info(f"Running function from {int_to_ip(ip_int)}: {function_name}")
@@ -629,6 +646,10 @@ class DoSP:
             if not message.startswith("%&DL}"): # Dont Log
                 self.logger.info(f"[MSG] {int_to_ip(ip_int)}: {message}")
         elif pkt.type == EXIT:
+            code, reason = pkt.payload.decode(errors='ignore').strip().split(",")
+            self.on_disconnect(ip_int, code=code, reason=reason)
+            # disconnect socket
+
             # TODO: Make it good
             pass
         elif pkt.type == S2C:
