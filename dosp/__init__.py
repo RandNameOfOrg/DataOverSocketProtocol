@@ -4,6 +4,130 @@ from .server import *
 from .client import Client
 
 
+def _load_config(path: str | None = None) -> dict:
+    """Load config from YAML file and .env file. Returns merged dict."""
+    import os
+
+    config: dict = {}
+
+    yaml_path = None
+    if path:
+        yaml_path = path
+    else:
+        for candidate in ("dosp.yaml", "dosp.yml", "config.yaml", "config.yml"):
+            if os.path.isfile(candidate):
+                yaml_path = candidate
+                break
+
+    if yaml_path:
+        try:
+            import yaml as _yaml
+            with open(yaml_path, encoding="utf-8") as f:
+                data = _yaml.safe_load(f)
+            if isinstance(data, dict):
+                config.update(data)
+        except ImportError:
+            print("yaml module not available; install with: pip install pyyaml")
+        except Exception as e:
+            print(f"Failed to load {yaml_path}: {e}")
+
+    env_path = os.environ.get("DOSP_ENV_FILE") or ".env"
+    if os.path.isfile(env_path):
+        try:
+            with open(env_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, _, val = line.partition("=")
+                    key = key.strip()
+                    val = val.strip().strip("\"'")
+                    os.environ.setdefault(key, val)
+        except Exception as e:
+            print(f"Failed to load {env_path}: {e}")
+
+    env_map = {
+        "serve": ("DOSP_SERVE", lambda v: v.lower() in ("1", "true", "yes")),
+        "host": ("DOSP_HOST", str),
+        "port": ("DOSP_PORT", int),
+        "ip_template": ("DOSP_IP_TEMPLATE", str),
+        "peers": ("DOSP_PEERS", lambda v: [p.strip() for p in v.split(",") if p.strip()]),
+        "debug": ("DOSP_DEBUG", lambda v: v.lower() in ("1", "true", "yes")),
+        "detach": ("DOSP_DETACH", lambda v: v.lower() in ("1", "true", "yes")),
+        "vip": ("DOSP_VIP", str),
+    }
+    for cfg_key, (env_key, cast) in env_map.items():
+        val = os.environ.get(env_key)
+        if val is not None:
+            try:
+                config[cfg_key] = cast(val)
+            except Exception:
+                pass
+
+    if config.get("ip_template") and "{x}" in config["ip_template"]:
+        config["ip_template"] = config["ip_template"].replace("{x}", "x")
+
+    return config
+
+
+def _merge_config(args, config: dict, key: str, arg_default=None):
+    """CLI arg wins over config file for non-None/non-default values."""
+    cli_val = getattr(args, key, None)
+    cfg_val = config.get(key)
+    if key in ("serve", "client", "debug", "detach"):
+        if cli_val:
+            return cli_val
+        if cfg_val:
+            return cfg_val
+        return arg_default if arg_default is not None else False
+    if key in ("host", "port", "ip_template", "vip"):
+        if cli_val is not None and cli_val != arg_default:
+            return cli_val
+        if cfg_val is not None:
+            return cfg_val
+        return arg_default
+    if key == "peers":
+        if cli_val is not None and cli_val != arg_default:
+            return cli_val
+        if cfg_val is not None:
+            return cfg_val
+        return arg_default
+    return cli_val if cli_val is not None else cfg_val
+
+
+def _gen_config():
+    """Write default dosp.yaml and .env example files."""
+    import os
+    yaml_content = """# DoSP server configuration
+serve: false          # Start the server on launch
+host: 0.0.0.0         # Bind address
+port: 7744            # Server port
+ip_template: 7.10.0.x # Virtual IP template
+debug: false          # Enable debug logging
+detach: false         # Run server in background thread
+# peers:              # Peer servers (host:port:template)
+#   - 10.0.0.50:7744:7.10.0.x
+"""
+    env_content = """# DoSP environment configuration
+# These override YAML config values, CLI args override both.
+DOSP_SERVE=false
+DOSP_HOST=0.0.0.0
+DOSP_PORT=7744
+DOSP_IP_TEMPLATE=7.10.0.x
+DOSP_DEBUG=false
+DOSP_DETACH=false
+# DOSP_PEERS=10.0.0.50:7744:7.10.0.x,10.0.0.51:7744:66.11.5.x
+# DOSP_VIP=7.10.0.10
+"""
+    for fname, content in (("dosp.yaml", yaml_content), (".env.example", env_content)):
+        if os.path.isfile(fname):
+            print(f"{fname} already exists, skipping")
+        else:
+            with open(fname, "w", encoding="utf-8") as f:
+                f.write(content.lstrip())
+            print(f"Created {fname}")
+
+
 def _main():
     import argparse
     import logging
@@ -18,36 +142,54 @@ def _main():
     parser.add_argument("--detach", action="store_true", help="Run server in background thread")
     parser.add_argument("--client", action="store_true", help="Connect as a client and enter interactive mode")
     parser.add_argument("--vip", default=None, help="Request a specific virtual IP")
+    parser.add_argument("--config", default=None, help="Path to YAML config file")
+    parser.add_argument("--gen-config", action="store_true", help="Generate default dosp.yaml and .env.example files")
 
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
+    if args.gen_config:
+        _gen_config()
+        return
 
-    if args.serve:
+    cfg = _load_config(args.config)
+
+    serve = _merge_config(args, cfg, "serve")
+    host = _merge_config(args, cfg, "host", "0.0.0.0")
+    port = _merge_config(args, cfg, "port", 7744)
+    ip_template = _merge_config(args, cfg, "ip_template", "7.10.0.x")
+    peers = _merge_config(args, cfg, "peers")
+    debug = _merge_config(args, cfg, "debug")
+    detach = _merge_config(args, cfg, "detach")
+    client_mode = _merge_config(args, cfg, "client")
+    vip = _merge_config(args, cfg, "vip")
+
+    logging.basicConfig(level=logging.DEBUG if debug else logging.INFO)
+
+    if serve:
         from .server.base import ServerConfig
-        config = ServerConfig(
-            host=args.host,
-            port=args.port,
-            ip_template=args.ip_template,
+        srv_cfg = ServerConfig(
+            host=host,
+            port=port,
+            ip_template=ip_template,
         )
-        server = DoSP(config)
-        if args.peers:
-            for peer_str in args.peers:
+        server = DoSP(srv_cfg)
+        if peers:
+            for peer_str in peers:
                 parts = peer_str.split(":")
-                host = parts[0]
-                port = int(parts[1]) if len(parts) > 1 else 7744
-                tmpl = parts[2] if len(parts) > 2 else None
-                server.add_peer_server(host, port, tmpl)
+                phost = parts[0]
+                pport = int(parts[1]) if len(parts) > 1 else 7744
+                ptmpl = parts[2] if len(parts) > 2 else None
+                server.add_peer_server(phost, pport, ptmpl)
         try:
-            server.start(detach=args.detach)
-            if args.detach:
-                print(f"Server started on {args.host}:{args.port} (detached)")
+            server.start(detach=detach)
+            if detach:
+                print(f"Server started on {host}:{port} (detached)")
         except KeyboardInterrupt:
             server.stop()
-    elif args.client:
-        host = args.host if args.host != "0.0.0.0" else "127.0.0.1"
-        client = Client(host=host, port=args.port, vip=args.vip)
-        print(f"Connected. Your vIP: {int_to_ip(client.vip_int)}")
+    elif client_mode:
+        chost = host if host != "0.0.0.0" else "127.0.0.1"
+        cli = Client(host=chost, port=port, vip=vip)
+        print(f"Connected. Your vIP: {int_to_ip(cli.vip_int)}")
         try:
             while True:
                 msg = input("> ")
@@ -58,7 +200,7 @@ def _main():
                     if len(parts) >= 3:
                         target = parts[1]
                         text = parts[2]
-                        client.send(Packet(S2C, text.encode(), dst_ip=ip_to_int(target)))
+                        cli.send(Packet(S2C, text.encode(), dst_ip=ip_to_int(target)))
                         print(f"Sent to {target}: {text}")
                     else:
                         print("Usage: /send <vip> <message>")
@@ -66,7 +208,7 @@ def _main():
                     print("Commands: /send <vip> <message>, /exit")
         except KeyboardInterrupt:
             pass
-        client.close()
+        cli.close()
     else:
         parser.print_help()
 

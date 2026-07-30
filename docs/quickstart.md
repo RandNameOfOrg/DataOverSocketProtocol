@@ -65,6 +65,29 @@ python -m dosp --serve --detach
 | `--detach` | — | Run server in background thread |
 | `--client` | — | Interactive client mode |
 | `--vip` | — | Request a specific vIP in client mode |
+| `--config` | — | Path to YAML config file |
+
+**Config file support** (precedence: CLI > env vars > config file > defaults):
+
+Use a `dosp.yaml` (auto-detected) or a custom path with `--config`:
+```yaml
+# dosp.yaml
+serve: true
+port: 7744
+ip_template: 7.34.43.x
+debug: true
+peers:
+  - 10.0.0.50:7744:7.10.0.x
+```
+
+Or `.env` file for environment variables:
+```bash
+DOSP_PORT=7744
+DOSP_IP_TEMPLATE=7.34.43.x
+DOSP_DEBUG=true
+```
+
+YAML config requires `pyyaml` (`pip install DoSP[yaml]` or `pip install pyyaml`).
 
 ## 2. Connect with GUI Client
 

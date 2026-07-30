@@ -20,6 +20,9 @@ dependencies = [
     "cryptography"
 ]
 
+[project.optional-dependencies]
+yaml = ["pyyaml"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = [
