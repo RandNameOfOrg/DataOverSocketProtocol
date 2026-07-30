@@ -42,7 +42,7 @@ heavy_packet_text = ("%&DL}" + str(text)).encode()
 test_packet_num = 1_000_00
 packet = Packet(MSG, heavy_packet_text)
 
-with Client(host="127.0.0.1", port=7744) as client:
+with Client(host="10.0.0.50", port=7744) as client:
     print("vIP:", int_to_ip(client.vip_int))
     start = time.time()
     for _ in range(test_packet_num):
