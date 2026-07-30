@@ -13,16 +13,43 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from .iptools import int_to_ip
 
+# Runtime compression support
+try:
+    import zlib as _real_zlib
+    _zlib_available = True
+except ImportError:
+    _zlib_available = False
+
+# Start with compression disabled (no-op)
+from types import SimpleNamespace
+zlib = SimpleNamespace()
+zlib.compress = lambda data: data
+zlib.decompress = lambda data: data
+compression_enabled = False
+compression_level = 6
+
+# Backward-compat alias (read-only)
 ENABLE_COMPRESSION = False
 
-if ENABLE_COMPRESSION:
-    import zlib
-else:
-    from types import SimpleNamespace
 
-    zlib = SimpleNamespace()
-    zlib.compress = lambda data: data
-    zlib.decompress = lambda data: data
+def set_compression(enabled: bool, level: int = 6):
+    """Enable or disable zlib compression at runtime.
+    Affects all subsequent Packet.to_bytes() and Packet.from_socket() calls.
+    """
+    global zlib, compression_enabled, compression_level, ENABLE_COMPRESSION
+    compression_enabled = enabled
+    compression_level = max(1, min(9, level))
+    if enabled and _zlib_available:
+        _real_level = compression_level
+
+        def _compress(data):
+            return _real_zlib.compress(data, _real_level)
+        zlib.compress = _compress
+        zlib.decompress = _real_zlib.decompress
+    else:
+        zlib.compress = lambda data: data
+        zlib.decompress = lambda data: data
+    ENABLE_COMPRESSION = enabled
 
 # region PacketTypes
 MSG = 0x01  # Message
@@ -45,6 +72,7 @@ BCST = 0x16  # Broadcast (admin only)
 AUTH = 0x17  # Authenticate (admin token)
 ADMIN = 0x18  # Admin command / response
 CLIENT_INFO = 0x19  # Client info (hash, metadata)
+MPAK = 0x1A  # Multi-packet aggregation (bundle multiple packets into one)
 
 packetTypes = {
     MSG: "MSG", PING: "PING",
@@ -55,7 +83,8 @@ packetTypes = {
     AIP: "AIP", HSK: "HSK",
     HC2C: "HC2C", GSI: "GSI",
     BCST: "BCST", AUTH: "AUTH",
-    ADMIN: "ADMIN", CLIENT_INFO: "CLIENT_INFO"
+    ADMIN: "ADMIN", CLIENT_INFO: "CLIENT_INFO",
+    MPAK: "MPAK"
 }
 _ = {}
 for k, v in packetTypes.items():
@@ -233,6 +262,51 @@ class Packet:
 
     def clear_cache(self):
         self._cached_bytes = None
+
+    def _serialize_sub(self) -> bytes:
+        """Serialize packet body for MPAK sub-packet (no compression, raw format)."""
+        if self.type == S2C:
+            dst_bytes = struct.pack(">I", self.dst_ip)
+            src_bytes = struct.pack(">I", self.src_ip or 0)
+            payload = dst_bytes + src_bytes + self.payload
+        else:
+            payload = self.payload
+        header = struct.pack(">BI", self.type, len(payload))
+        return header + payload
+
+    @staticmethod
+    def multi(packets: list['Packet']) -> 'Packet':
+        """Create a multi-packet (MPAK) from a list of packets.
+        All sub-packets are serialized without compression, then
+        compressed together as one payload when to_bytes() is called.
+        """
+        raw = b''.join(p._serialize_sub() for p in packets)
+        return Packet(MPAK, raw)
+
+    def unpack(self) -> list['Packet']:
+        """Unpack an MPAK packet into individual Packet objects.
+        Only valid for MPAK type packets.
+        """
+        if self.type != MPAK:
+            raise ValueError("Packet is not MPAK")
+        data = self.payload
+        packets = []
+        offset = 0
+        while offset + 5 <= len(data):
+            sub_type = data[offset]
+            length = struct.unpack(">I", data[offset+1:offset+5])[0]
+            offset += 5
+            if offset + length > len(data):
+                break
+            payload = data[offset:offset+length]
+            offset += length
+            if sub_type == S2C:
+                dst_ip = struct.unpack(">I", payload[:4])[0] if len(payload) >= 8 else 0
+                src_ip = struct.unpack(">I", payload[4:8])[0] if len(payload) >= 8 else 0
+                packets.append(Packet(sub_type, payload[8:], dst_ip=dst_ip, src_ip=src_ip))
+            else:
+                packets.append(Packet(sub_type, payload))
+        return packets
 
     def to_bytes(self) -> bytes:
         if self._cached_bytes:

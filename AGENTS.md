@@ -47,12 +47,13 @@ examples/                # reference scripts
 - S2C (0x03) payload is: `[4B dst_ip][4B src_ip][compressed user data]`
 - All other types payload is: `[compressed user data]`
 - `struct.pack(">BI", ...)` — 1 byte type, 4 bytes length. README says "2B TYPE" but code says 1 byte; code is truth.
-- Compression: module-level `ENABLE_COMPRESSION = False` in `protocol.py`. When off, zlib is a no-op pass-through. Also configurable per-server via `ServerConfig.allow_compression`.
+- Compression: runtime-toggleable via `protocol.set_compression(enabled, level)`. `ServerConfig.allow_compression` + `compression_level` control it. Client auto-enables compression if server advertises it. Packet methods use module-level `zlib` reference that gets swapped at runtime.
 
 ## Admin & Client Identity
 - **Client hash**: Auto-generated on `Client.__init__()` via `get_client_hash()` — uses MAC address + hostname + machine GUID (Windows) or `/etc/machine-id` (Linux). SHA256 hex digest. Cannot be set externally without modifying source code. Sent to server as `CLIENT_INFO (0x19)` packet right after handshake.
 - **Admin auth**: Server checks `CLIENT_INFO` hash against `ServerConfig.banned_hashes` (or whitelist). Client sends admin token via `AUTH (0x17)` packet. Server marks `RemoteClient.is_admin = True`.
 - **Admin tokens**: Generated via `generate_admin_token(username, password)` = `sha256(user:pass)`. If `ServerConfig.admin_tokens` is empty, server auto-generates a random hex token (logged to console). Can also write to a file via `admin_token_file` config.
+- **ServerConfig** fields: `allow_compression`, `compression_level` (1-9), `max_packet_size` (0=unlimited), `socket_timeout` (0=blocking), `max_clients` (0=unlimited).
 - **Admin commands**: `ADMIN (0x18)` packet. Server-side `_handle_admin_command()` dispatches: `clients`, `kick`, `ban`, `unban`, `whitelist`, `block`, `unblock`, `stats`, `broadcast`, `help`, `exit`.
 - **Broadcast**: `BCST (0x16)` packet — admin-only. Server sends payload as `MSG (0x01)` to all connected clients. Returns `BCST` response to admin with recipient count.
 - **Server counters**: `server_packets_received`, `server_packets_sent` on `DoSP`. Per-client: `packets_received`, `packets_sent` on `RemoteClient`.

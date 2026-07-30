@@ -47,6 +47,8 @@ class Client:
         self.logger = logging.getLogger(__name__)
         # Auto-generate stable client hash (cannot be set by external code)
         self._client_hash = get_client_hash()
+        # MPAK unpack queue
+        self._mpak_queue: list[Packet] = []
         # Short S2C protection counters per peer
         self._short_s2c: dict[int, deque] = {}
         self._short_s2c_last_alert: dict[int, float] = {}
@@ -107,6 +109,9 @@ class Client:
             self.logger.info(f"[vnet] vnet version: {version}")
             self.logger.info(f"[vnet] vnet server token: {server_token}")
             self.logger.info(f"[vnet] Compression status: {compression_byte}")
+            if enable_compression:
+                from dosp.protocol import set_compression
+                set_compression(True)
             if req_compress and not enable_compression:
                 self.logger.error(f"[vnet] Compression required, but not enabled on the server. Dropping conn")
                 self.close("Compression required")
@@ -292,6 +297,19 @@ class Client:
     def __exit__(self, exc_type, exc_value, traceback):
         self.sock.close()
 
+    def send_multi(self, packets: list[Packet], on_error=None):
+        """Send multiple packets bundled as a single compressed MPAK packet.
+        All sub-packets must be destined for the server (not C2C tunnels).
+        """
+        if not self.running:
+            return
+        try:
+            self.sock.sendall(Packet.multi(packets).to_bytes())
+        except Exception as e:
+            self.logger.error(f"[vnet] Error sending MPAK: {e}")
+            if on_error is None:
+                raise PacketError("failed to send MPAK: " + str(e))
+
     def send(self, pkt: Packet, on_error = None):
         if not self.running: return
         pkt.src_ip = self.vip_int
@@ -312,9 +330,20 @@ class Client:
         if not self.check_connection() or not self.running:
             return None
         try:
+            # Drain MPAK sub-packet queue first
+            if self._mpak_queue:
+                return self._mpak_queue.pop(0)
+
             pkt = Packet.from_socket(self.sock)
             if pkt is None:
                 return None
+
+            # Transparently unpack MPAK packets
+            if pkt.type == MPAK:
+                self._mpak_queue = pkt.unpack()
+                if not self._mpak_queue:
+                    return None
+                pkt = self._mpak_queue.pop(0)
 
             self.logger.debug(f"Received raw packet: {pkt}")
 
@@ -575,6 +604,7 @@ class LocalClient(Client):
         self.running = True
         self.config = {}
         self.tunnels = {}
+        self._mpak_queue = []
         self._short_s2c = {}
         self._short_s2c_last_alert = {}
         self._short_s2c_threshold = 10
@@ -594,6 +624,16 @@ class LocalClient(Client):
             except Exception as e:
                 self.logger.error(f"Failed to request IP: {e}")
 
+    def send_multi(self, packets: list[Packet], on_error=None):
+        """Send multiple packets bundled as a single compressed MPAK packet."""
+        mpak = Packet.multi(packets)
+        try:
+            self.server.handle_packet(mpak, None, self.vip_int)
+        except Exception as e:
+            self.logger.error(f"[vnet] Error sending MPAK: {e}")
+            if on_error is None:
+                raise PacketError("failed to send MPAK: " + str(e))
+
     def send(self, pkt: Packet, on_error=None):
         pkt.src_ip = self.vip_int
         try:
@@ -604,11 +644,20 @@ class LocalClient(Client):
                 raise PacketError("failed to send packet: " + str(e))
 
     def receive(self, on_error=None) -> Packet | None:
+        # Drain MPAK sub-packet queue first
+        if self._mpak_queue:
+            return self._mpak_queue.pop(0)
         with self.server.lock:
             rc = self.server.clients.get(self.vip_int)
         if rc is None:
             return None
-        return rc.receive()
+        pkt = rc.receive()
+        if pkt and pkt.type == MPAK:
+            self._mpak_queue = pkt.unpack()
+            if not self._mpak_queue:
+                return None
+            return self._mpak_queue.pop(0)
+        return pkt
 
     def close(self, reason=""):
         self.running = False

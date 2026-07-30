@@ -98,36 +98,53 @@ def _merge_config(args, config: dict, key: str, arg_default=None):
 
 
 def _gen_config():
-    """Write default dosp.yaml and .env example files."""
+    """Write default dosp.yaml config file."""
     import os
-    yaml_content = """# DoSP server configuration
-serve: false          # Start the server on launch
-host: 0.0.0.0         # Bind address
-port: 7744            # Server port
-ip_template: 7.10.0.x # Virtual IP template
-debug: false          # Enable debug logging
-detach: false         # Run server in background thread
-# peers:              # Peer servers (host:port:template)
+    content = """# DoSP server configuration
+serve: false            # Start the server on launch
+host: 0.0.0.0           # Bind address
+port: 7744              # Server port
+ip_template: 7.10.0.x   # Virtual IP template
+debug: false            # Enable debug logging
+detach: false           # Run server in background thread
+
+# Compression
+allow_compression: false
+compression_level: 6
+
+# Limits
+max_clients: 256
+socket_timeout: 30.0    # seconds, 0 for blocking
+# max_packet_size: 65536  # bytes, 0 for unlimited
+
+# Admin
+# admin_tokens:
+#   - <sha256-hex-token>
+# admin_token_file: admin.token
+# banned_hashes:
+#   - <sha256-hex>
+# whitelist_hashes:
+#   - <sha256-hex>
+# hash_whitelist_enabled: false
+
+# Peers (host:port:template)
+# peers:
 #   - 10.0.0.50:7744:7.10.0.x
+#   - 10.0.0.51:7744:66.11.5.x
+
+# WebSocket (requires simple-websocket)
+# wss_enabled: false
+# wss_port: 7745
+# wss_certfile: path/to/cert.pem
+# wss_keyfile: path/to/key.pem
 """
-    env_content = """# DoSP environment configuration
-# These override YAML config values, CLI args override both.
-DOSP_SERVE=false
-DOSP_HOST=0.0.0.0
-DOSP_PORT=7744
-DOSP_IP_TEMPLATE=7.10.0.x
-DOSP_DEBUG=false
-DOSP_DETACH=false
-# DOSP_PEERS=10.0.0.50:7744:7.10.0.x,10.0.0.51:7744:66.11.5.x
-# DOSP_VIP=7.10.0.10
-"""
-    for fname, content in (("dosp.yaml", yaml_content), (".env.example", env_content)):
-        if os.path.isfile(fname):
-            print(f"{fname} already exists, skipping")
-        else:
-            with open(fname, "w", encoding="utf-8") as f:
-                f.write(content.lstrip())
-            print(f"Created {fname}")
+    fname = "dosp.yaml"
+    if os.path.isfile(fname):
+        print(f"{fname} already exists, skipping")
+    else:
+        with open(fname, "w", encoding="utf-8") as f:
+            f.write(content.lstrip())
+        print(f"Created {fname}")
 
 
 def _main():
@@ -148,7 +165,7 @@ def _main():
     parser.add_argument("--admin-exec", default=None, help="Execute admin command and exit")
     parser.add_argument("--vip", default=None, help="Request a specific virtual IP")
     parser.add_argument("--config", default=None, help="Path to YAML config file")
-    parser.add_argument("--gen-config", action="store_true", help="Generate default dosp.yaml and .env.example files")
+    parser.add_argument("--gen-config", action="store_true", help="Generate default dosp.yaml config file")
 
     args = parser.parse_args()
 

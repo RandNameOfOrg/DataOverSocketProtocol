@@ -7,7 +7,6 @@ from hashlib import sha256
 from dataclasses import dataclass, field
 
 from dosp.protocol import *
-from dosp.protocol import ENABLE_COMPRESSION
 from dosp.iptools import ip_to_int, int_to_ip
 from dosp.ws_transport import (
     WebSocketTransport,
@@ -59,7 +58,11 @@ class ServerConfig:
     ip_template: str = "7.10.0.x"
 
     allow_local: bool = False
-    allow_compression: bool = ENABLE_COMPRESSION
+    allow_compression: bool = False
+    compression_level: int = 6
+    max_packet_size: int = 0
+    socket_timeout: float = 30.0
+    max_clients: int = 256
     peers: list[dict] = field(default_factory=list)
     remote_servers_limit: int = 64
     max_hops: int = 8
@@ -207,6 +210,15 @@ class DoSP:
                         f.write(self.admin_token_auto)
                 except Exception as e:
                     self.logger.warning(f"Could not write admin token file: {e}")
+
+        # Apply runtime compression config
+        if self.config.allow_compression:
+            from dosp.protocol import set_compression
+            set_compression(True, self.config.compression_level)
+            self.logger.info(f"Compression enabled (level={self.config.compression_level})")
+        else:
+            from dosp.protocol import set_compression
+            set_compression(False)
 
         # Forwarding loop-prevention TTL store: key -> remaining hops
         self._forward_ttl: dict[tuple[int, int], int] = {}  # (dst_ip, digest) -> ttl
@@ -652,6 +664,18 @@ class DoSP:
 
         :param sock: The socket object of the client connection.
         """
+        if self.config.socket_timeout > 0 and sock is not None:
+            sock.settimeout(self.config.socket_timeout)
+        with self.lock:
+            if self.config.max_clients > 0 and len(self.clients) >= self.config.max_clients:
+                self.logger.warning("Max clients reached, rejecting connection")
+                if sock is not None:
+                    try:
+                        sock.sendall(Packet(EXIT, b"Server full").to_bytes())
+                    except Exception:
+                        pass
+                    sock.close()
+                return
         ip_int, ip_id = self._next_ip()
         with self.lock:
             self.clients[ip_int] = RemoteClient(sock, ip_int, self.logger)
@@ -666,7 +690,11 @@ class DoSP:
                 pkt = Packet.from_socket(sock, src_ip=ip_int)
                 if pkt is None:
                     break
-                self.handle_packet(pkt, sock, ip_int)
+                if pkt.type == MPAK:
+                    for sub_pkt in pkt.unpack():
+                        self.handle_packet(sub_pkt, sock, ip_int)
+                else:
+                    self.handle_packet(pkt, sock, ip_int)
         except ConnectionResetError:
             self.logger.info(f"Client {int_to_ip(ip_int)} forcibly closed the connection")
         except Exception as e:
@@ -957,6 +985,13 @@ class DoSP:
         src_ip = pkt.src_ip or ip_int
         with self.lock:
             src_rc = self.clients.get(ip_int)
+
+        # Enforce max packet size
+        if self.config.max_packet_size > 0 and len(pkt.to_bytes()) > self.config.max_packet_size:
+            self.logger.warning(f"Packet from {int_to_ip(ip_int)} exceeds max size ({len(pkt.to_bytes())} > {self.config.max_packet_size})")
+            if src_rc:
+                src_rc.send(Packet(ERR, b"Packet too large"))
+            return
 
         self.server_packets_received += 1
         if src_rc:
