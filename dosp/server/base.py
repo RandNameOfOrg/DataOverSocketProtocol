@@ -7,6 +7,7 @@ import pydantic
 from pydantic import Field
 
 from dosp.protocol import *
+from dosp.protocol import ENABLE_COMPRESSION
 from dosp.iptools import ip_to_int, int_to_ip
 
 class RemoteServer:
@@ -131,7 +132,9 @@ class DoSP:
             pass
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.clients: dict[int, RemoteClient] = {}  # ip_int -> ServerClient
+        self.host = self.config.host
+        self.port = self.config.port
+        self.clients: dict[int, RemoteClient] = {}
         self.lock = threading.Lock()
         self.assigned_ids = set()
 
@@ -270,20 +273,18 @@ class DoSP:
                         self.logger.debug(f"Failed to handle advertisement from peer[{idx}]: {e}")
                     continue
                 if pkt.type == S2C:
-                    # Try local delivery first
                     dst_ip = pkt.dst_ip
                     src_ip = pkt.src_ip or 0
                     delivered = False
                     with self.lock:
-                        dst_sock = self.clients.get(dst_ip)
-                    if dst_sock and dst_sock.sock is not None:
+                        dst_rc = self.clients.get(dst_ip)
+                    if dst_rc:
                         try:
-                            dst_sock.sock.sendall(Packet(S2C, pkt.payload, dst_ip=dst_ip, src_ip=src_ip).to_bytes())
+                            dst_rc.send(Packet(S2C, pkt.payload, dst_ip=dst_ip, src_ip=src_ip))
                             delivered = True
                         except Exception as e:
                             self.logger.error(f"Failed to deliver from peer[{idx}] to local {int_to_ip(dst_ip)}: {e}")
                     if not delivered:
-                        # Forward further, exclude the immediately previous peer to reduce loops
                         self._forward_s2c(dst_ip, src_ip, pkt.payload, exclude_peer_idx=idx)
                     continue
                 if pkt.type == ERR:
@@ -571,16 +572,17 @@ class DoSP:
                 if pkt is None:
                     break
                 self.handle_packet(pkt, sock, ip_int)
+                with self.lock:
+                    rc = self.clients.get(ip_int)
+                    if rc and rc.should_disconnect:
+                        break
         except ConnectionResetError:
             self.logger.info(f"Client {int_to_ip(ip_int)} forcibly closed the connection")
         except Exception as e:
             self.logger.error(f"Error with client {int_to_ip(ip_int)}: {e}")
         finally:
-            # try:
             if sock:
                 sock.close()
-            # except:
-            #     pass
             with self.lock:
                 self.clients.pop(ip_int, None)
                 self.assigned_ids.discard(ip_id)
@@ -617,21 +619,17 @@ class DoSP:
 
     def on_disconnect(self, ip_int: int, code: str = "", reason: str = None):
         self.logger.info(f"Client disconnected: {int_to_ip(ip_int)}")
-        match code.encode():
-            case ClientExitCodes.ClientClosed:
-                code = "Just exited"
-            case ClientExitCodes.ProcessExit:
-                code = "ProcessExit"
-            case ClientExitCodes.UnexpectedError:
-                code = "UnexpectedError"
-            case "":
-                code = "No code provided"
-            case _:
-                code = "unknown code"
+        label_map = {
+            "CC": "Just exited",
+            "EX": "ProcessExit",
+            "UE": "UnexpectedError",
+            "": "No code provided",
+        }
+        label = label_map.get(code, f"unknown code ({code})")
         if reason:
-            self.logger.info(f"Client {int_to_ip(ip_int)} disconnected: {reason} ({code})")
+            self.logger.info(f"Client {int_to_ip(ip_int)} disconnected: {reason} ({label})")
         else:
-            self.logger.info(f"Client {int_to_ip(ip_int)} disconnected: {code}")
+            self.logger.info(f"Client {int_to_ip(ip_int)} disconnected: {label}")
 
     def on_function(self, function_name: str, ip_int: int) -> tuple[bool, str]:
         self.logger.info(f"Running function from {int_to_ip(ip_int)}: {function_name}")
@@ -639,31 +637,36 @@ class DoSP:
 
     def handle_packet(self, pkt: Packet, sock: socket.socket, ip_int: int):
         src_ip = pkt.src_ip or ip_int
-        # print("Size of packet:", pkt.size())
+        with self.lock:
+            src_rc = self.clients.get(ip_int)
+
+        def reply(p: Packet):
+            if src_rc:
+                src_rc.send(p)
 
         if pkt.type == MSG:
             message = pkt.payload.decode(errors='ignore')
-            if not message.startswith("%&DL}"): # Dont Log
+            if not message.startswith("%&DL}"):
                 self.logger.info(f"[MSG] {int_to_ip(ip_int)}: {message}")
         elif pkt.type == EXIT:
-            code, reason = pkt.payload.decode(errors='ignore').strip().split(",")
+            parts = pkt.payload.decode(errors='ignore').strip().split(",", 1)
+            code = parts[0] if len(parts) > 0 else ""
+            reason = parts[1] if len(parts) > 1 else None
             self.on_disconnect(ip_int, code=code, reason=reason)
-            # disconnect socket
-
-            # TODO: Make it good
-            pass
+            if src_rc:
+                src_rc.should_disconnect = True
+        elif pkt.type == PING:
+            reply(Packet(PING, b""))
         elif pkt.type == S2C:
             dst_ip = pkt.dst_ip
-            # Try local delivery first
             with self.lock:
-                dst_sock = self.clients.get(dst_ip)
-            if dst_sock:
+                dst_rc = self.clients.get(dst_ip)
+            if dst_rc:
                 try:
-                    dst_sock.sock.sendall(Packet(S2C, pkt.payload, dst_ip=dst_ip, src_ip=src_ip).to_bytes())
+                    dst_rc.send(Packet(S2C, pkt.payload, dst_ip=dst_ip, src_ip=src_ip))
                 except Exception as e:
                     self.logger.error(f"Failed to route to {int_to_ip(dst_ip)}: {e}")
             else:
-                # Try peer forwarding (chained) with TTL and next-hop selection
                 forwarded = self._forward_s2c(dst_ip, src_ip, pkt.payload)
                 if not forwarded:
                     self.logger.warning(f"No client or peer for IP {int_to_ip(dst_ip)} or TTL exhausted")
@@ -671,15 +674,14 @@ class DoSP:
             done, msg = self.on_function(pkt.payload.decode(), ip_int)
             if not done:
                 self.logger.error(f"Function {pkt.payload.decode()} from {int_to_ip(ip_int)} failed: {msg}")
-                sock.sendall(Packet(ERR, msg.encode(), src_ip=self.server_ip).to_bytes())
+                reply(Packet(ERR, msg.encode(), src_ip=self.server_ip))
         elif pkt.type == GCL:
             self.logger.debug(f"[{int_to_ip(ip_int)}] Getting clients list")
             with self.lock:
                 clients_ips = [ip.to_bytes(4, 'big') for ip in self.clients.keys()]
                 payload = b"".join(clients_ips)
-                sock.sendall(Packet(GCL, payload).to_bytes())
+                reply(Packet(GCL, payload))
         elif pkt.type == SD:
-            # Attempt to map this socket to a known peer and ingest advertisement
             try:
                 rhost, rport = sock.getpeername()
                 mapped_idx = None
@@ -698,27 +700,26 @@ class DoSP:
             self.logger.debug(f"[{int_to_ip(ip_int)}] Requesting IP {int_to_ip(new_ip)}")
             if new_ip in self.config.banned_ip_list:
                 self.logger.warning(f"IP {int_to_ip(new_ip)} is in block list")
-                sock.sendall(Packet(RQIP, b"E:IP can't be used").to_bytes())
+                reply(Packet(RQIP, b"E:IP can't be used"))
                 return
             if new_ip in self.assigned_ids:
                 self.logger.warning(f"IP {int_to_ip(new_ip)} is already assigned to {int_to_ip(ip_int)}")
-                sock.sendall(Packet(RQIP, b"E:IP already in use").to_bytes())
+                reply(Packet(RQIP, b"E:IP already in use"))
                 return
             try:
                 with self.lock:
                     if ip_int in self.assigned_ids:
                         self.assigned_ids.remove(ip_int)
-                    client_sock = self.clients.pop(ip_int, None)
-                    self.clients[new_ip] = client_sock
+                    client_obj = self.clients.pop(ip_int, None)
+                    self.clients[new_ip] = client_obj
                     self.assigned_ids.add(new_ip)
-                # send client success
             except Exception as e:
                 print("Failed to rewrite client id:", e)
             finally:
                 self.on_disconnect(new_ip)
-            sock.sendall(Packet(RQIP, b"D:").to_bytes())
-            sock.sendall(Packet(AIP, new_ip.to_bytes(4, 'big')).to_bytes())
+            reply(Packet(RQIP, b"D:"))
+            reply(Packet(AIP, new_ip.to_bytes(4, 'big')))
             self.logger.debug(f"[{int_to_ip(ip_int)}] got new vIP {int_to_ip(new_ip)}")
         else:
             self.logger.warning(f"Unknown packet type {hex(pkt.type)} from {int_to_ip(ip_int)}")
-            sock.sendall(Packet(ERR, bytes(int(ERR_CODES.UKNP))).to_bytes())
+            reply(Packet(ERR, bytes([ERR_CODES.UKNP])))

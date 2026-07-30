@@ -52,23 +52,3 @@ with Client(host="127.0.0.1", port=7744) as client:
     print("Time elapsed:", end - start)
     print("Packets sent:", f"{test_packet_num:,}")
     print("Packet size:", packet.size(), "bytes")
-    exit(0)
-    client.do_c2c_handshake(c2c_vip=client.vip_int - 1)
-
-    client.send(Packet(
-        S2C,
-        b"Hello client",
-        dst_ip=ip_to_int("7.10.0.4")  # send to this client for testing
-    ), on_error="ignore")
-
-    while True:
-        pkt = client.receive()
-        print(pkt, "BRUH")
-        if pkt is None or pkt.type == EXIT:
-            break
-        print()
-        client.send(Packet(
-            S2C,
-            b"",
-            dst_ip=ip_to_int("7.10.0.4")  # send to this client for testing
-        ), on_error="ignore")

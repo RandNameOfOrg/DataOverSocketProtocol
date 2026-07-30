@@ -72,25 +72,15 @@ class ClientExitCodes:
 
 
 class ERR_CODES:
-    """Error codes"""
-    """Function not found"""
-    FNF: bytes = 0x01
-    """Function failed"""
-    FF: bytes = 0x02
-    """S2C failed"""
-    S2CF: bytes = 0x03
-    """RQIP failed"""
-    RQIPF: bytes = 0x04
-    """SD packet failed"""
-    SDF: bytes = 0x05
-    """Get client list packet failed"""
-    GCLF: bytes = 0x06
-    """Assign vIP failed"""
-    AIPF: bytes = 0x07
-    """Handshake failed"""
-    HSKF: bytes = 0x08
-    """Unknown packet"""
-    UKNP: bytes = 0x09
+    FNF = 0x01
+    FF = 0x02
+    S2CF = 0x03
+    RQIPF = 0x04
+    SDF = 0x05
+    GCLF = 0x06
+    AIPF = 0x07
+    HSKF = 0x08
+    UKNP = 0x09
 
     code_to_error = {
         FNF: "Function not found",
@@ -189,7 +179,6 @@ def derive_tunnel_keys(shared_secret: bytes, info: bytes = b'dosp-c2c-v1') -> di
 
 class Packet:
     def __init__(self, type_: int, payload: bytes, dst_ip: int = None, src_ip: int = None, encryption_key=None):
-        globals().update(packetTypes)
         self.type = type_
         self.payload = payload
         self.dst_ip = dst_ip
@@ -278,12 +267,11 @@ class Packet:
 
 
 class IClient(ABC):
-    """Interface for a client"""
 
     def send(self, pkt: Packet) -> None:
         raise NotImplementedError
 
-    def recv(self) -> Packet | None:
+    def receive(self) -> Packet | None:
         raise NotImplementedError
 
 
@@ -298,6 +286,8 @@ class RemoteClient(IClient):
         self.sock = sock
         self.ip = ip
         self.logger = logger
+        self.message_queue: list[Packet] = []
+        self.should_disconnect = False
 
         self.encryption_key = encryption_key
         if encryption_key is not None:
@@ -308,9 +298,15 @@ class RemoteClient(IClient):
     def send(self, pkt: Packet) -> None:
         if self.sock is not None:
             self.sock.sendall(pkt.to_bytes())
+        else:
+            self.message_queue.append(pkt)
 
-    def recv(self) -> Packet | None:
-        return Packet.from_socket(self.sock)
+    def receive(self) -> Packet | None:
+        if self.sock is not None:
+            return Packet.from_socket(self.sock)
+        if self.message_queue:
+            return self.message_queue.pop(0)
+        return None
 
 
 class TunneledClient(IClient):

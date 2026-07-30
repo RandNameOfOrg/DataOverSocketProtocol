@@ -2,7 +2,13 @@
 ![PyPI - Version](https://img.shields.io/pypi/v/DoSP)
 ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/RandNameOfOrg/DataOverSocketProtocol/python-publish.yml)
 
-**DoSP** (Data over socket Protocol) — TCP-протокол, работающий по умолчанию на порту `7744`. Используется для маршрутизации и пересылки сообщений между клиентами через центральный сервер.
+**DoSP** (Data over socket Protocol) — TCP-протокол, работающий по умолчанию на порту `7744`. Используется для маршрутизации и пересылки сообщений между клиентами через сервера.
+
+# WARNING!
+> REPO GOAL CHANGED, just found out about yggdrasil, so now it will be used for secure access
+
+## Для чего он нужен? (Why use this?)
+> Для удаленного доступа к удаленным серверам
 
 ---
 

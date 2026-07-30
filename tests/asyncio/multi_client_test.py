@@ -10,7 +10,8 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from dosp.client import Client
-from dosp.protocol import Packet, S2C, MSG, int_to_ip, ip_to_int
+from dosp.protocol import Packet, S2C, MSG
+from dosp.iptools import int_to_ip, ip_to_int
 
 try:
     # When run as a module: python -m tests.asyncio.multi_client_test

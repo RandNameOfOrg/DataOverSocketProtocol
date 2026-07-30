@@ -4,7 +4,8 @@ import threading
 import time
 
 from dosp.client import Client
-from dosp.protocol import Packet, S2C, MSG, int_to_ip, ip_to_int
+from dosp.protocol import Packet, S2C, MSG
+from dosp.iptools import int_to_ip, ip_to_int
 
 HOST = os.getenv("VNET_HOST", "127.0.0.1")
 PORT = int(os.getenv("VNET_PORT", "7744"))

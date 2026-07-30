@@ -22,7 +22,7 @@ class Client:
                  host: str = "127.0.0.1",
                  port: int = 7744,
                  vip = None, fixed_vip = False, client_id: int | None = None,
-                 require_compression = True):
+                 require_compression = False):
         """
         Client constructor for DoS Protocol
         :param host: DoSP server host (or host:port)
@@ -66,15 +66,16 @@ class Client:
         self.logger.info(f"[vnet] Virtual IP: {int_to_ip(self.vip_int)}")
         pkt = Packet.from_socket(self.sock)
         if pkt.type == HSK:
-            decoded = pkt.payload.decode()
-            self.config = eval(decoded[1:])
-            enable_compression = decoded[0]
+            compression_byte = pkt.payload[0] if pkt.payload else 0
+            config_json = pkt.payload[1:].decode()
+            self.config = eval(config_json)
+            enable_compression = compression_byte == 1
             version = self.config[0]
             server_token = self.config[1]
             self.logger.info(f"[vnet] vnet version: {version}")
             self.logger.info(f"[vnet] vnet server token: {server_token}")
-            self.logger.info(f"[vnet] Compression status: {enable_compression}")
-            if req_compress and int(enable_compression) != 1:
+            self.logger.info(f"[vnet] Compression status: {compression_byte}")
+            if req_compress and not enable_compression:
                 self.logger.error(f"[vnet] Compression required, but not enabled on the server. Dropping conn")
                 self.close("Compression required")
                 return
@@ -454,16 +455,21 @@ class Client:
         if not self.sock:
             self.logger.warning("vnet connection not established")
             return False
-        # TODO: send ping request to check connection, make that parallel (asyncio)
-
-        return True
+        try:
+            self.sock.sendall(b"")
+            return True
+        except Exception:
+            return False
 
     def close(self, reason=""):
         self.logger.info(f"[vnet] closing connection")
         self.running = False
-        payload = b"CC," + reason.encode()
+        if reason:
+            payload = f"CC,{reason}".encode()
+        else:
+            payload = b"CC"
         try:
-            self.sock.sendall(Packet(EXIT, payload=b"CC").to_bytes())
+            self.sock.sendall(Packet(EXIT, payload=payload).to_bytes())
         except Exception:
             pass
         self.sock.close()
@@ -476,18 +482,26 @@ class LocalClient(Client):
             raise HandshakeError("server is not running or allow_local is disabled")
 
         self.server = server
+        self.running = True
+        self.config = {}
+        self.tunnels = {}
+        self._short_s2c = {}
+        self._short_s2c_last_alert = {}
+        self._short_s2c_threshold = 10
+        self._short_s2c_window = 60.0
+        self._short_s2c_cooldown = 60.0
+
+        self.sock = None
         self.vip_int = server.local_connect(self)
         self.logger = logging.getLogger(__name__)
-        self.logger.level = logging.INFO
+        self.logger.setLevel(logging.INFO)
 
-        # Simulate handshake
         if vip:
             try:
                 pkt = Packet(RQIP, bytes(ip_to_int(vip)))
                 self.server.handle_packet(pkt, None, self.vip_int)
             except Exception as e:
                 self.logger.error(f"Failed to request IP: {e}")
-        super().__init__(vip)
 
     def send(self, pkt: Packet, on_error=None):
         pkt.src_ip = self.vip_int
@@ -497,10 +511,20 @@ class LocalClient(Client):
             self.logger.error(f"[vnet] Error sending packet: {e}")
             if on_error is None:
                 raise PacketError("failed to send packet: " + str(e))
-            elif on_error == "ignore":
-                return
 
     def receive(self, on_error=None) -> Packet | None:
-        # Local clients need to implement their own message queue
-        # This would require changes to the server to support message queues for local clients
-        raise NotImplementedError("Message queue for local clients not implemented yet")
+        with self.server.lock:
+            rc = self.server.clients.get(self.vip_int)
+        if rc is None:
+            return None
+        return rc.receive()
+
+    def close(self, reason=""):
+        self.running = False
+        with self.server.lock:
+            self.server.clients.pop(self.vip_int, None)
+            self.server.assigned_ids.discard(self.vip_int)
+        self.server.on_disconnect(self.vip_int, code="CC", reason=reason)
+
+    def check_connection(self):
+        return self.running
