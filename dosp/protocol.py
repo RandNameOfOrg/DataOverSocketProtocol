@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import logging
+import os
 import socket
 import struct
 from abc import ABC
@@ -40,6 +41,10 @@ ERR = 0x12  # Error
 AIP = 0x13  # Assign IP
 HSK = 0x14  # Handshake
 HC2C = 0x15  # Handshake to client prefix
+BCST = 0x16  # Broadcast (admin only)
+AUTH = 0x17  # Authenticate (admin token)
+ADMIN = 0x18  # Admin command / response
+CLIENT_INFO = 0x19  # Client info (hash, metadata)
 
 packetTypes = {
     MSG: "MSG", PING: "PING",
@@ -48,7 +53,9 @@ packetTypes = {
     RQIP: "RQIP", SA: "SA",
     EXIT: "EXIT", ERR: "ERR",
     AIP: "AIP", HSK: "HSK",
-    HC2C: "HC2C", GSI: "GSI"
+    HC2C: "HC2C", GSI: "GSI",
+    BCST: "BCST", AUTH: "AUTH",
+    ADMIN: "ADMIN", CLIENT_INFO: "CLIENT_INFO"
 }
 _ = {}
 for k, v in packetTypes.items():
@@ -155,6 +162,44 @@ def decrypt(data: bytes, key: bytes) -> bytes:
         return cipher.decrypt_and_verify(ciphertext, tag)
     except ValueError as e:
         raise ValueError("Decryption failed: invalid tag or corrupted data") from e
+
+
+def get_client_hash() -> str:
+    """Generate a unique client identifier based on stable system hardware info.
+    Uses MAC address, hostname, and machine ID.
+    Cannot be overridden externally without modifying this source code.
+    """
+    import platform
+    import uuid
+    mac = uuid.getnode()
+    hostname = socket.gethostname()
+    machine_id = ""
+    try:
+        if platform.system() == "Windows":
+            import winreg
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SOFTWARE\Microsoft\Cryptography"
+            ) as key:
+                machine_id = winreg.QueryValueEx(key, "MachineGuid")[0]
+        else:
+            for p in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+                if os.path.exists(p):
+                    with open(p) as f:
+                        machine_id = f.read().strip()
+                    break
+    except Exception:
+        pass
+    raw = f"{mac:x}:{hostname}:{machine_id}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def generate_admin_token(username: str, password: str) -> str:
+    """Generate an admin auth token from username and password.
+    Token = sha256(username + ':' + password)
+    """
+    raw = f"{username}:{password}"
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 def derive_tunnel_keys(shared_secret: bytes, info: bytes = b'dosp-c2c-v1') -> dict:
@@ -294,6 +339,13 @@ class RemoteClient(IClient):
             self.encryption_completed = len(encryption_key) == 32
         else:
             self.encryption_completed = False
+
+        # Admin & identity fields
+        self.is_admin: bool = False
+        self.client_hash: str = ""
+        self.connected_at: float = 0.0
+        self.packets_received: int = 0
+        self.packets_sent: int = 0
 
     def send(self, pkt: Packet) -> None:
         if self.sock is not None:
@@ -512,5 +564,6 @@ __all__ = [
               'ERR_CODES', 'VNetError', 'HandshakeError', 'PacketError',
               "encrypt", "decrypt", "RemoteClient", "TunneledClient",
               "encryptedTypes", "packetTypes", "ClientExitCodes",
-              "derive_tunnel_keys", "MAC_SIZE", "GCM_NONCE_SIZE"
+              "derive_tunnel_keys", "MAC_SIZE", "GCM_NONCE_SIZE",
+              "get_client_hash", "generate_admin_token"
           ] + [x for x in packetTypes.keys() if not isinstance(x, int)]

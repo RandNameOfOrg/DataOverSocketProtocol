@@ -240,5 +240,5 @@ def simple_interactive_client():
 if __name__ == "__main__":
     print("=== 🚀 Interactive DoSP Client ===")
     print("using IMC client")
-    client = InteractiveMessageClient("127.0.0.1", "7.10.0.1")
+    client = InteractiveMessageClient("10.0.0.50")
     client.run()

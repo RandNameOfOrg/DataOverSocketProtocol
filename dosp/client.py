@@ -7,6 +7,7 @@ from cryptography.hazmat.primitives import serialization
 
 from .server import DoSP
 from .iptools import int_to_ip, ip_to_int
+from .ws_transport import ws_available, create_ws_client_transport, WebSocketTransport
 
 
 class Client:
@@ -15,14 +16,18 @@ class Client:
     tunnels: dict[int, TunneledClient] = {}
 
     logger: logging.Logger
-    sock: socket.socket
+    sock: socket.socket | WebSocketTransport
     running: bool
+
+    # Client identity (auto-generated, cannot be overridden)
+    _client_hash: str
 
     def __init__(self,
                  host: str = "127.0.0.1",
                  port: int = 7744,
                  vip = None, fixed_vip = False, client_id: int | None = None,
-                 require_compression = False):
+                 require_compression = False,
+                 use_ws: bool = False, ws_tls: bool = False):
         """
         Client constructor for DoS Protocol
         :param host: DoSP server host (or host:port)
@@ -30,6 +35,8 @@ class Client:
         :param vip: what vIP will be requested
         :param fixed_vip: close connection if requested vIP can not be assigned
         :param require_compression: whether to require compression, drops connection if server does not support it
+        :param use_ws: use WebSocket (ws://) instead of raw TCP
+        :param ws_tls: use TLS for WebSocket (wss://), requires use_ws=True
         """
         if ":" in host:
             try:
@@ -38,23 +45,48 @@ class Client:
             except ValueError:
                 raise ConnectionError("Invalid host: \"{}\"".format(host))
         self.logger = logging.getLogger(__name__)
+        # Auto-generate stable client hash (cannot be set by external code)
+        self._client_hash = get_client_hash()
         # Short S2C protection counters per peer
         self._short_s2c: dict[int, deque] = {}
         self._short_s2c_last_alert: dict[int, float] = {}
         self._short_s2c_threshold = 10   # events
         self._short_s2c_window = 60.0    # seconds
         self._short_s2c_cooldown = 60.0  # seconds
-        self.initializate_connection(host, port, vip=vip, fixed_vip=fixed_vip, req_compress=require_compression)
+        self.initializate_connection(host, port, vip=vip, fixed_vip=fixed_vip,
+                                     req_compress=require_compression,
+                                     use_ws=use_ws, ws_tls=ws_tls)
 
         self.logger.level = logging.INFO
 
     def initializate_connection(self,
                                 host: str = "127.0.0.1",
                                 port: int = 7744,
-                                vip = None, fixed_vip = False, socket_params: dict = None, **kwargs):
-        self.sock = socket.create_connection((host, port), **(socket_params or {}))
+                                vip = None, fixed_vip = False, socket_params: dict = None,
+                                use_ws: bool = False, ws_tls: bool = False, **kwargs):
+        if use_ws:
+            if not ws_available():
+                raise ImportError(
+                    "WebSocket requires simple-websocket. Install with: pip install simple-websocket"
+                )
+            scheme = "wss" if ws_tls else "ws"
+            url = f"{scheme}://{host}:{port}/"
+            self.logger.info(f"Connecting via {scheme}://{host}:{port}")
+            self.sock = create_ws_client_transport(url)
+        else:
+            self.sock = socket.create_connection((host, port), **(socket_params or {}))
         self.do_handshake(vip=vip, cancel_on_RQIP_err=fixed_vip, **kwargs)
         self.running = True
+        # Send client identity hash after connection
+        self._send_client_info()
+
+    def _send_client_info(self):
+        """Send client hash to server after connection."""
+        try:
+            pkt = Packet(CLIENT_INFO, self._client_hash.encode())
+            self.sock.sendall(pkt.to_bytes())
+        except Exception as e:
+            self.logger.warning(f"Failed to send client info: {e}")
 
     def do_handshake(self, vip = None,
                      cancel_on_RQIP_err = False, req_compress=False):
@@ -461,6 +493,64 @@ class Client:
         except Exception:
             return False
 
+    def get_client_hash(self) -> str:
+        """Return the auto-generated client hash (read-only)."""
+        return self._client_hash
+
+    def authenticate_admin(self, token: str) -> bool:
+        """Authenticate as server admin using an admin token.
+        Returns True if server confirms admin privileges.
+        """
+        if not self.running:
+            return False
+        try:
+            pkt = Packet(AUTH, token.encode())
+            self.sock.sendall(pkt.to_bytes())
+            resp = Packet.from_socket(self.sock)
+            if resp and resp.type == AUTH and resp.payload == b"OK":
+                self.logger.info("[admin] Authenticated as admin")
+                return True
+            reason = resp.payload.decode(errors='ignore') if resp else "no response"
+            self.logger.warning(f"[admin] Auth failed: {reason}")
+            return False
+        except Exception as e:
+            self.logger.error(f"[admin] Auth error: {e}")
+            return False
+
+    def broadcast(self, message: str) -> str | None:
+        """Send a broadcast message as admin. Requires prior admin auth.
+        Returns server response text or None on failure.
+        """
+        if not self.running:
+            return None
+        try:
+            pkt = Packet(BCST, message.encode())
+            self.sock.sendall(pkt.to_bytes())
+            resp = Packet.from_socket(self.sock)
+            if resp:
+                return resp.payload.decode(errors='ignore')
+            return None
+        except Exception as e:
+            self.logger.error(f"[admin] Broadcast error: {e}")
+            return None
+
+    def admin_command(self, command: str) -> str | None:
+        """Send an admin command to the server. Requires prior admin auth.
+        Returns server response text or None on failure.
+        """
+        if not self.running:
+            return None
+        try:
+            pkt = Packet(ADMIN, command.encode())
+            self.sock.sendall(pkt.to_bytes())
+            resp = Packet.from_socket(self.sock)
+            if resp:
+                return resp.payload.decode(errors='ignore')
+            return None
+        except Exception as e:
+            self.logger.error(f"[admin] Command error: {e}")
+            return None
+
     def close(self, reason=""):
         self.logger.info(f"[vnet] closing connection")
         self.running = False
@@ -490,6 +580,7 @@ class LocalClient(Client):
         self._short_s2c_threshold = 10
         self._short_s2c_window = 60.0
         self._short_s2c_cooldown = 60.0
+        self._client_hash = get_client_hash()
 
         self.sock = None
         self.vip_int = server.local_connect(self)

@@ -2,6 +2,8 @@ from .iptools import ip_to_int, int_to_ip, ip_to_id
 from .protocol import *
 from .server import *
 from .client import Client
+from .admin_cli import main as admin_cli_main
+from .ws_transport import WebSocketTransport, WSServerConfig, ws_available
 
 
 def _load_config(path: str | None = None) -> dict:
@@ -140,7 +142,10 @@ def _main():
     parser.add_argument("--peers", nargs="*", metavar="HOST:PORT:TEMPLATE", help="Peer servers to connect to")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--detach", action="store_true", help="Run server in background thread")
+    parser.add_argument("--token", default=None, help="Admin token (for --admin mode)")
     parser.add_argument("--client", action="store_true", help="Connect as a client and enter interactive mode")
+    parser.add_argument("--admin", action="store_true", help="Connect as admin (opens admin CLI)")
+    parser.add_argument("--admin-exec", default=None, help="Execute admin command and exit")
     parser.add_argument("--vip", default=None, help="Request a specific virtual IP")
     parser.add_argument("--config", default=None, help="Path to YAML config file")
     parser.add_argument("--gen-config", action="store_true", help="Generate default dosp.yaml and .env.example files")
@@ -209,6 +214,26 @@ def _main():
         except KeyboardInterrupt:
             pass
         cli.close()
+    elif args.admin or args.admin_exec:
+        from .admin_cli import run_interactive, run_exec
+        chost = host if host != "0.0.0.0" else "127.0.0.1"
+        token = args.token or os.environ.get("DOSP_ADMIN_TOKEN")
+        if args.admin_exec and not token:
+            # try reading token file
+            from .admin_cli import read_token_file
+            token = read_token_file()
+        if not token:
+            print("Error: Admin token required. Set DOSP_ADMIN_TOKEN or pass --token")
+            return
+        cli = Client(host=chost, port=port, vip=vip)
+        if not cli.authenticate_admin(token):
+            print("Error: Admin authentication failed")
+            cli.close()
+            return
+        if args.admin_exec:
+            run_exec(cli, args.admin_exec)
+        else:
+            run_interactive(cli)
     else:
         parser.print_help()
 

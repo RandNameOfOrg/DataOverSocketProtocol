@@ -12,6 +12,9 @@ DoSP is a TCP-based protocol designed for routing and forwarding messages betwee
 - **End-to-End Encryption**: AES-GCM encryption with HMAC-SHA256 authentication
 - **Diffie-Hellman Key Exchange**: Secure X25519 ECDH for C2C tunnels
 - **Message Types**: Comprehensive packet types for various operations
+- **Remote Administration**: Admin CLI tool with token-based authentication
+- **Client Identity Hashing**: Hardware-based client fingerprint for ban/whitelist
+- **Server Broadcast**: Admin-only broadcast to all connected clients
 
 ## Architecture
 
@@ -22,18 +25,29 @@ DoSP is a TCP-based protocol designed for routing and forwarding messages betwee
    - Virtual IP assignment
    - Peer federation management
    - Client connection handling
+   - Admin authentication & command dispatch
+   - Broadcast to all clients
 
 2. **Client** (`dosp.client.Client`)
    - Connect to DoSP servers
    - Send/receive messages
    - Establish C2C encrypted tunnels
    - Support for both remote and local connections
+   - Admin authentication and remote administration
 
 3. **Protocol** (`dosp.protocol`)
    - Packet encoding/decoding
    - Encryption/decryption utilities
    - Message type definitions
    - Network utilities
+   - Client hash generation (`get_client_hash()`)
+   - Admin token generation (`generate_admin_token()`)
+
+4. **Admin CLI** (`dosp.admin_cli`)
+   - Remote server administration
+   - Token-based authentication (login or direct)
+   - Interactive shell or single-command mode
+   - Client management (kick, ban, whitelist)
 
 ### Virtual IP System
 

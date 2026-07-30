@@ -1,6 +1,7 @@
 import logging
 import socket
 import threading
+import time
 from hashlib import sha256
 
 from dataclasses import dataclass, field
@@ -8,6 +9,12 @@ from dataclasses import dataclass, field
 from dosp.protocol import *
 from dosp.protocol import ENABLE_COMPRESSION
 from dosp.iptools import ip_to_int, int_to_ip
+from dosp.ws_transport import (
+    WebSocketTransport,
+    WSServerConfig,
+    ws_available,
+    create_ws_server_transport,
+)
 
 class RemoteServer:
     def __init__(self, host: str, port: int, ip_template: str, hop_count: int = 0, source_peer_idx: int | None = None):
@@ -62,6 +69,20 @@ class ServerConfig:
         0x0000,  # Server token (allows to determine what types after 0x1F is)
     ])
     logger_name: str | None = None
+
+    # Admin
+    admin_tokens: list[str] = field(default_factory=list)
+    banned_hashes: list[str] = field(default_factory=list)
+    whitelist_hashes: list[str] = field(default_factory=list)
+    hash_whitelist_enabled: bool = False
+    admin_token_file: str | None = None
+
+    # WSS (WebSocket Secure)
+    wss_enabled: bool = False
+    wss_port: int = 7745
+    wss_certfile: str | None = None
+    wss_keyfile: str | None = None
+    wss_keyfile_password: str | None = None
 
 
 class DoSP:
@@ -132,6 +153,21 @@ class DoSP:
             pass
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.wss_sock = None
+        self._wss_server_config = None
+        if self.config.wss_enabled:
+            if not ws_available():
+                raise ImportError(
+                    "WSS enabled but simple-websocket is not installed. "
+                    "Install it with: pip install simple-websocket"
+                )
+            self._wss_server_config = WSServerConfig(
+                port=self.config.wss_port,
+                host=self.config.host,
+                certfile=self.config.wss_certfile,
+                keyfile=self.config.wss_keyfile,
+                keyfile_password=self.config.wss_keyfile_password,
+            )
         self.host = self.config.host
         self.port = self.config.port
         self.clients: dict[int, RemoteClient] = {}
@@ -150,6 +186,27 @@ class DoSP:
         # Registry for templates
         self.direct_templates: dict[str, int] = {}  # ip_template -> direct peer index
         self.learned_next_hops: dict[str, list[int]] = {}  # ip_template -> [peer_idx]
+
+        # Admin state
+        self._admin_clients: set[int] = set()  # set of vip_int that are authed as admin
+        self.admin_token_auto: str | None = None
+
+        # Server lifetime counters
+        self.server_packets_received: int = 0
+        self.server_packets_sent: int = 0
+
+        # Auto-generate admin token if none configured
+        if not self.config.admin_tokens:
+            import secrets
+            self.admin_token_auto = secrets.token_hex(16)
+            self.config.admin_tokens = [self.admin_token_auto]
+            self.logger.info(f"Auto-generated admin token: {self.admin_token_auto}")
+            if self.config.admin_token_file:
+                try:
+                    with open(self.config.admin_token_file, "w") as f:
+                        f.write(self.admin_token_auto)
+                except Exception as e:
+                    self.logger.warning(f"Could not write admin token file: {e}")
 
         # Forwarding loop-prevention TTL store: key -> remaining hops
         self._forward_ttl: dict[tuple[int, int], int] = {}  # (dst_ip, digest) -> ttl
@@ -501,6 +558,29 @@ class DoSP:
         except Exception as e:
             self.logger.error(f"Peer init error: {e}")
 
+        def _accept_wss():
+            if not self._wss_server_config:
+                return
+            wss_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            wss_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            wss_sock.bind((self.config.host, self.config.wss_port))
+            wss_sock.listen()
+            self.wss_sock = wss_sock
+            proto = "WSS" if self.config.wss_certfile else "WS"
+            self.logger.info(f"{proto} listening on {self.config.host}:{self.config.wss_port}")
+            while self.running:
+                try:
+                    client_sock, addr = wss_sock.accept()
+                    transport = create_ws_server_transport(
+                        client_sock, addr, self._wss_server_config
+                    )
+                    threading.Thread(
+                        target=self.handle_client, args=(transport,), daemon=True
+                    ).start()
+                except Exception as e:
+                    if self.running:
+                        self.logger.error(f"WSS accept error: {e}")
+
         def bind() -> None:
             self.sock.bind((self.config.host, self.config.port))
             self.sock.listen()
@@ -517,6 +597,8 @@ class DoSP:
                     self.logger.error(f"Accept error: {e}")
 
         if not detach:
+            if self._wss_server_config:
+                threading.Thread(target=_accept_wss, daemon=True).start()
             bind()
             return None
 
@@ -524,6 +606,9 @@ class DoSP:
             return self.thread
 
         self.thread = threading.Thread(target=bind, daemon=True)
+        if self._wss_server_config:
+            self._wss_thread = threading.Thread(target=_accept_wss, daemon=True)
+            self._wss_thread.start()
         self.thread.start()
         return self.thread
 
@@ -542,6 +627,11 @@ class DoSP:
         except Exception:
             pass
         self.sock.close()
+        if self.wss_sock:
+            try:
+                self.wss_sock.close()
+            except Exception:
+                pass
         self.running = False
 
     def handle_client(self, sock: socket.socket):
@@ -568,14 +658,15 @@ class DoSP:
         try:
             self.on_connect(sock, ip_int)
             while True:
+                # Check for pending disconnect before blocking on recv
+                with self.lock:
+                    rc = self.clients.get(ip_int)
+                    if rc is None or rc.should_disconnect:
+                        break
                 pkt = Packet.from_socket(sock, src_ip=ip_int)
                 if pkt is None:
                     break
                 self.handle_packet(pkt, sock, ip_int)
-                with self.lock:
-                    rc = self.clients.get(ip_int)
-                    if rc and rc.should_disconnect:
-                        break
         except ConnectionResetError:
             self.logger.info(f"Client {int_to_ip(ip_int)} forcibly closed the connection")
         except Exception as e:
@@ -590,6 +681,10 @@ class DoSP:
 
     def on_connect(self, sock: socket.socket, ip_int: int):
         self.logger.info(f"Client connected: {int_to_ip(ip_int)}")
+        with self.lock:
+            rc = self.clients.get(ip_int)
+            if rc:
+                rc.connected_at = time.time()
         if sock is not None:
             pkt_aip = Packet(AIP, ip_int.to_bytes(4, 'big'))
             pkt_hsk = Packet(HSK, self.config.allow_compression.to_bytes() + str(self.config.clients_conf).encode())
@@ -635,14 +730,243 @@ class DoSP:
         self.logger.info(f"Running function from {int_to_ip(ip_int)}: {function_name}")
         return False, "Not enabled"
 
+    def _is_admin(self, ip_int: int) -> bool:
+        return ip_int in self._admin_clients
+
+    def _check_banned_hash(self, client_hash: str) -> bool:
+        if not client_hash:
+            return False
+        if self.config.hash_whitelist_enabled:
+            return client_hash not in self.config.whitelist_hashes
+        return client_hash in self.config.banned_hashes
+
+    def _broadcast(self, payload: bytes, exclude_ip: int | None = None) -> int:
+        """Send a packet to all connected clients. Returns count of recipients."""
+        count = 0
+        with self.lock:
+            for vip, rc in list(self.clients.items()):
+                if exclude_ip is not None and vip == exclude_ip:
+                    continue
+                try:
+                    rc.send(Packet(MSG, payload))
+                    rc.packets_sent += 1
+                    self.server_packets_sent += 1
+                    count += 1
+                except Exception as e:
+                    self.logger.error(f"Broadcast to {int_to_ip(vip)} failed: {e}")
+        return count
+
+    def _force_disconnect(self, rc: RemoteClient) -> None:
+        """Force-disconnect a client: send EXIT, close socket, mark for removal."""
+        try:
+            rc.send(Packet(EXIT, b"Disconnected by admin"))
+        except Exception:
+            pass
+        rc.should_disconnect = True
+        if rc.sock is not None:
+            try:
+                rc.sock.close()
+            except Exception:
+                pass
+            rc.sock = None
+
+    def _handle_admin_command(self, payload: bytes, ip_int: int) -> str:
+        """Process an admin command payload. Returns response string."""
+        cmd = payload.decode(errors='ignore').strip()
+        parts = cmd.split()
+        if not parts:
+            return "ERR:Empty command"
+
+        command = parts[0].lower()
+        args = parts[1:]
+
+        if command == "help":
+            return (
+                "Commands:\n"
+                "  help                     - this help\n"
+                "  clients                  - list connected clients\n"
+                "  client <vip>             - show client details\n"
+                "  kick <vip>               - disconnect a client\n"
+                "  ban <vip>                - ban client by hash\n"
+                "  unban <hash>             - remove hash from ban list\n"
+                "  whitelist <hash>         - add hash to whitelist\n"
+                "  whitelist-remove <hash>  - remove hash from whitelist\n"
+                "  whitelist-on             - enable whitelist-only mode\n"
+                "  whitelist-off            - disable whitelist-only mode\n"
+                "  block <vip>              - block a VIP address\n"
+                "  unblock <vip>            - unblock a VIP address\n"
+                "  stats                    - server & per-client packet stats\n"
+                "  broadcast <message>      - send message to all clients\n"
+                "  exit                     - disconnect admin session"
+            )
+
+        elif command == "clients":
+            with self.lock:
+                if not self.clients:
+                    return "No clients connected"
+                lines = []
+                for vip, rc in sorted(self.clients.items()):
+                    ip_s = int_to_ip(vip)
+                    admin_tag = " [ADMIN]" if rc.is_admin else ""
+                    hash_preview = rc.client_hash[:16] + "..." if rc.client_hash else "N/A"
+                    uptime = int(time.time() - rc.connected_at) if rc.connected_at else 0
+                    lines.append(
+                        f"  {ip_s}{admin_tag}  hash={hash_preview}  "
+                        f"uptime={uptime}s  rx={rc.packets_received}  tx={rc.packets_sent}"
+                    )
+                return f"Clients ({len(self.clients)}):\n" + "\n".join(lines)
+
+        elif command == "client":
+            if not args:
+                return "ERR:Usage: client <vip>"
+            try:
+                target_ip = ip_to_int(args[0])
+            except Exception:
+                return f"ERR:Invalid VIP: {args[0]}"
+            with self.lock:
+                rc = self.clients.get(target_ip)
+            if not rc:
+                return f"ERR:Client {args[0]} not found"
+            return (
+                f"Client {int_to_ip(target_ip)}:\n"
+                f"  Hash: {rc.client_hash or 'N/A'}\n"
+                f"  Admin: {rc.is_admin}\n"
+                f"  Connected: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(rc.connected_at)) if rc.connected_at else 'N/A'}\n"
+                f"  Packets received: {rc.packets_received}\n"
+                f"  Packets sent: {rc.packets_sent}\n"
+                f"  Should disconnect: {rc.should_disconnect}"
+            )
+
+        elif command == "kick":
+            if not args:
+                return "ERR:Usage: kick <vip>"
+            try:
+                target_ip = ip_to_int(args[0])
+            except Exception:
+                return f"ERR:Invalid VIP: {args[0]}"
+            with self.lock:
+                rc = self.clients.get(target_ip)
+            if not rc:
+                return f"ERR:Client {args[0]} not found"
+            self._force_disconnect(rc)
+            return f"Client {args[0]} kicked"
+
+        elif command == "ban":
+            if not args:
+                return "ERR:Usage: ban <vip>"
+            try:
+                target_ip = ip_to_int(args[0])
+            except Exception:
+                return f"ERR:Invalid VIP: {args[0]}"
+            with self.lock:
+                rc = self.clients.get(target_ip)
+            if not rc or not rc.client_hash:
+                return f"ERR:Client {args[0]} has no hash or not found"
+            h = rc.client_hash
+            if h not in self.config.banned_hashes:
+                self.config.banned_hashes.append(h)
+            self._force_disconnect(rc)
+            return f"Client {args[0]} banned (hash: {h[:16]}...)"
+
+        elif command == "unban":
+            if not args:
+                return "ERR:Usage: unban <hash>"
+            h = args[0]
+            if h in self.config.banned_hashes:
+                self.config.banned_hashes.remove(h)
+                return f"Hash {h[:16]}... removed from ban list"
+            return "ERR:Hash not in ban list"
+
+        elif command == "whitelist":
+            if not args:
+                return "ERR:Usage: whitelist <hash>"
+            h = args[0]
+            if h not in self.config.whitelist_hashes:
+                self.config.whitelist_hashes.append(h)
+            return f"Hash {h[:16]}... added to whitelist"
+
+        elif command == "whitelist-remove":
+            if not args:
+                return "ERR:Usage: whitelist-remove <hash>"
+            h = args[0]
+            if h in self.config.whitelist_hashes:
+                self.config.whitelist_hashes.remove(h)
+                return f"Hash {h[:16]}... removed from whitelist"
+            return "ERR:Hash not in whitelist"
+
+        elif command == "whitelist-on":
+            self.config.hash_whitelist_enabled = True
+            return "Whitelist-only mode enabled"
+
+        elif command == "whitelist-off":
+            self.config.hash_whitelist_enabled = False
+            return "Whitelist-only mode disabled"
+
+        elif command == "block":
+            if not args:
+                return "ERR:Usage: block <vip>"
+            try:
+                target_ip = ip_to_int(args[0])
+            except Exception:
+                return f"ERR:Invalid VIP: {args[0]}"
+            if target_ip not in self.config.banned_ip_list:
+                self.config.banned_ip_list.append(target_ip)
+            return f"VIP {args[0]} blocked"
+
+        elif command == "unblock":
+            if not args:
+                return "ERR:Usage: unblock <vip>"
+            try:
+                target_ip = ip_to_int(args[0])
+            except Exception:
+                return f"ERR:Invalid VIP: {args[0]}"
+            if target_ip in self.config.banned_ip_list:
+                self.config.banned_ip_list.remove(target_ip)
+            return f"VIP {args[0]} unblocked"
+
+        elif command == "stats":
+            lines = [
+                f"Server packets received: {self.server_packets_received}",
+                f"Server packets sent:     {self.server_packets_sent}",
+                f"Clients connected:       {len(self.clients)}",
+                f"Banned hashes:           {len(self.config.banned_hashes)}",
+                f"Whitelist hashes:        {len(self.config.whitelist_hashes)}",
+                f"Whitelist mode:          {'ON' if self.config.hash_whitelist_enabled else 'OFF'}",
+                f"Admin tokens configured: {len(self.config.admin_tokens)}",
+            ]
+            return "\n".join(lines)
+
+        elif command == "broadcast":
+            if not args:
+                return "ERR:Usage: broadcast <message>"
+            message = " ".join(args)
+            count = self._broadcast(message.encode(), exclude_ip=ip_int)
+            return f"Broadcast sent to {count} clients"
+
+        elif command == "exit" or command == "quit":
+            with self.lock:
+                rc = self.clients.get(ip_int)
+            if rc:
+                rc.should_disconnect = True
+            return "Goodbye"
+
+        else:
+            return f"ERR:Unknown command: {command}. Type 'help' for available commands."
+
     def handle_packet(self, pkt: Packet, sock: socket.socket, ip_int: int):
         src_ip = pkt.src_ip or ip_int
         with self.lock:
             src_rc = self.clients.get(ip_int)
 
+        self.server_packets_received += 1
+        if src_rc:
+            src_rc.packets_received += 1
+
         def reply(p: Packet):
             if src_rc:
                 src_rc.send(p)
+                src_rc.packets_sent += 1
+                self.server_packets_sent += 1
 
         if pkt.type == MSG:
             message = pkt.payload.decode(errors='ignore')
@@ -664,6 +988,8 @@ class DoSP:
             if dst_rc:
                 try:
                     dst_rc.send(Packet(S2C, pkt.payload, dst_ip=dst_ip, src_ip=src_ip))
+                    dst_rc.packets_sent += 1
+                    self.server_packets_sent += 1
                 except Exception as e:
                     self.logger.error(f"Failed to route to {int_to_ip(dst_ip)}: {e}")
             else:
@@ -681,6 +1007,56 @@ class DoSP:
                 clients_ips = [ip.to_bytes(4, 'big') for ip in self.clients.keys()]
                 payload = b"".join(clients_ips)
                 reply(Packet(GCL, payload))
+        elif pkt.type == CLIENT_INFO:
+            if src_rc:
+                hash_len = 64
+                hash_val = pkt.payload[:hash_len].decode(errors='ignore')
+                if hash_val:
+                    src_rc.client_hash = hash_val
+                    if self._check_banned_hash(hash_val):
+                        self.logger.warning(
+                            f"Client {int_to_ip(ip_int)} with hash {hash_val[:16]}... is banned/not-whitelisted; disconnecting"
+                        )
+                        reply(Packet(EXIT, b"Your client hash is blocked"))
+                        if src_rc:
+                            src_rc.should_disconnect = True
+                    else:
+                        self.logger.info(
+                            f"Client {int_to_ip(ip_int)} registered hash: {hash_val[:16]}..."
+                        )
+        elif pkt.type == AUTH:
+            if not src_rc:
+                return
+            token = pkt.payload.decode(errors='ignore').strip()
+            if token in self.config.admin_tokens:
+                self._admin_clients.add(ip_int)
+                src_rc.is_admin = True
+                self.logger.info(f"Client {int_to_ip(ip_int)} authenticated as admin")
+                reply(Packet(AUTH, b"OK"))
+            else:
+                self.logger.warning(f"Failed admin auth attempt from {int_to_ip(ip_int)}")
+                reply(Packet(AUTH, b"ERR:Invalid token"))
+        elif pkt.type == ADMIN:
+            if not src_rc:
+                return
+            if not self._is_admin(ip_int):
+                reply(Packet(ADMIN, b"ERR:Not authenticated as admin"))
+                return
+            try:
+                resp = self._handle_admin_command(pkt.payload, ip_int)
+                reply(Packet(ADMIN, resp.encode()))
+            except Exception as e:
+                self.logger.error(f"Admin command error from {int_to_ip(ip_int)}: {e}")
+                reply(Packet(ADMIN, f"ERR:{e}".encode()))
+        elif pkt.type == BCST:
+            if not src_rc:
+                return
+            if not self._is_admin(ip_int):
+                reply(Packet(ERR, b"ERR:Admin only"))
+                return
+            count = self._broadcast(pkt.payload, exclude_ip=ip_int)
+            self.logger.info(f"Admin {int_to_ip(ip_int)} broadcast to {count} clients")
+            reply(Packet(BCST, f"Broadcast sent to {count} clients".encode()))
         elif pkt.type == SD:
             try:
                 rhost, rport = sock.getpeername()

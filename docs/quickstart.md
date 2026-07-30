@@ -64,6 +64,9 @@ python -m dosp --serve --detach
 | `--debug` | — | Enable debug logging |
 | `--detach` | — | Run server in background thread |
 | `--client` | — | Interactive client mode |
+| `--admin` | — | Connect as admin (opens admin CLI) |
+| `--admin-exec CMD` | — | Execute admin command and exit |
+| `--token TOKEN` | — | Admin auth token |
 | `--vip` | — | Request a specific vIP in client mode |
 | `--config` | — | Path to YAML config file |
 
@@ -126,6 +129,24 @@ Run it:
 ```bash
 python client.py
 ```
+
+### Admin CLI
+
+```bash
+# Interactive admin shell
+python -m dosp --admin --host 127.0.0.1 --port 7744 --token <token>
+
+# Single command
+python -m dosp --admin-exec "clients" --host 127.0.0.1 --port 7744 --token <token>
+```
+
+Admin CLI arguments (also available via `dosp-admin` command):
+| Argument | Description |
+|---|---|
+| `--token` | Admin auth token |
+| `--login USER PASS` | Generate token from username:password |
+| `--exec CMD` | Execute one command and exit |
+| `--token-file PATH` | Read token from file (default: `dosp_admin.token`) |
 
 ## 4. Send Client-to-Client Messages
 
@@ -320,6 +341,87 @@ client.send(Packet(GCL, b"request"))
 client.do_c2c_handshake(c2c_vip="7.10.0.3", use_dh=True)
 
 # Check logs for errors
+```
+
+## 7. Server Administration
+
+Administer your running DoSP server remotely via the admin CLI tool.
+
+### Token / Account Generation
+
+**Via login** (username + password → token):
+```bash
+dosp-admin --host 127.0.0.1 --port 7744 --login admin changeme
+```
+The CLI generates the token locally: `sha256("admin:changeme")`.
+
+**Via pre-generated token**:
+```bash
+# Generate a token programmatically
+python -c "from dosp import generate_admin_token; print(generate_admin_token('admin', 'changeme'))"
+
+# Use it
+dosp-admin --host 127.0.0.1 --port 7744 --token <hex-token>
+```
+
+**Auto-generated token** (no config needed):
+When no `admin_tokens` are configured in `ServerConfig`, the server prints a random token to console on startup:
+```
+INFO - dosp.server.base - Auto-generated admin token: a1b2c3d4e5f6...
+```
+For headless servers, set `admin_token_file` to auto-write the token:
+```python
+ServerConfig(admin_token_file="dosp_admin.token")
+```
+
+### Starting a Server with Admin
+
+```python
+from dosp.server import DoSP, ServerConfig
+from dosp.protocol import generate_admin_token
+
+config = ServerConfig(
+    host="0.0.0.0",
+    port=7744,
+    admin_tokens=[generate_admin_token("admin", "changeme")],
+    # Optional: whitelist-only mode
+    whitelist_hashes=["<known-client-hash>"],
+    hash_whitelist_enabled=False,
+)
+
+server = DoSP(config)
+server.start()
+```
+
+### Admin Commands
+
+| Command | Description |
+|---|---|
+| `help` | List all commands |
+| `clients` | List connected clients with hash, uptime, packet counts |
+| `client <vip>` | Show detailed info for a specific client |
+| `kick <vip>` | Disconnect a client |
+| `ban <vip>` | Ban a client by its hardware hash |
+| `unban <hash>` | Remove a hash from the ban list |
+| `whitelist <hash>` | Add a hash to the whitelist |
+| `whitelist-remove <hash>` | Remove a hash from the whitelist |
+| `whitelist-on` | Enable whitelist-only mode (blocks non-whitelisted) |
+| `whitelist-off` | Disable whitelist-only mode |
+| `block <vip>` | Block a VIP address |
+| `unblock <vip>` | Unblock a VIP address |
+| `stats` | Show server and per-client packet statistics |
+| `broadcast <message>` | Send a message to all connected clients |
+| `exit` | Disconnect admin session |
+
+### Client Identity Hash
+
+Every `Client` auto-generates a stable hash from system hardware on connect. The server uses this for ban/whitelist. It cannot be set or overridden without modifying source code.
+
+```python
+from dosp import Client
+
+client = Client(host="127.0.0.1")
+print(client.get_client_hash())  # e.g. "69120ed21fa0d65b..."
 ```
 
 ## Next Steps

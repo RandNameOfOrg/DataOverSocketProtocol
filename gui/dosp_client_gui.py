@@ -24,7 +24,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dosp.client import Client
 from dosp.protocol import Packet, MSG, S2C, GCL, PING, EXIT, ERR, AIP, HC2C, GSI
-from dosp.protocol import int_to_ip, ip_to_int, HandshakeError, PacketError
+from dosp.iptools import int_to_ip, ip_to_int
+from dosp.protocol import HandshakeError, PacketError
 
 
 class DoSPGUIClient(ctk.CTk):
@@ -154,19 +155,19 @@ class DoSPGUIClient(ctk.CTk):
         self.send_btn.configure(state="disabled")
     
     def log_message(self, message: str, color: str = None):
-        """Add message to log display"""
+        """Add message to log display (thread-safe — schedules on main thread)"""
         timestamp = datetime.now().strftime("%H:%M:%S")
         formatted = f"[{timestamp}] {message}\n"
         
+        self.after(0, lambda: self._insert_log(formatted))
+    
+    def _insert_log(self, formatted: str):
+        """Insert text into log widget (runs on main thread via after())"""
         self.log_text.configure(state="normal")
-        if color:
-            self.log_text.insert("end", formatted)
-            # Note: customtkinter doesn't support text tags, so color is ignored
-        else:
-            self.log_text.insert("end", formatted)
+        self.log_text.insert("end", formatted)
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
-    
+
     def display_message(self, message: str, msg_type: str = "info"):
         """Display received message"""
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -237,6 +238,8 @@ class DoSPGUIClient(ctk.CTk):
     
     def _on_connected(self):
         """Called when connection succeeds"""
+        if not self.client:
+            return
         vip_str = int_to_ip(self.client.vip_int)
         self.log_message(f"✅ Connected! Your vIP: {vip_str}", "green")
         self.display_message(f"Connected to server. Your vIP: {vip_str}", "system")
@@ -374,27 +377,28 @@ class DoSPGUIClient(ctk.CTk):
     
     def receive_loop(self):
         """Background thread for receiving messages"""
+        stale_none = 0
         while self.running:
             try:
                 pkt = self.client.receive(on_error="ignore")
                 
                 if pkt is None:
+                    stale_none += 1
+                    if stale_none > 5:
+                        break
                     time.sleep(0.1)
                     continue
                 
+                stale_none = 0
                 self.process_packet(pkt)
                 
-            except PacketError:
-                if self.running:
-                    self.after(0, lambda: self.log_message("Connection lost", "red"))
-                break
             except Exception as e:
                 if self.running:
-                    self.after(0, lambda: self.log_message(f"Receive error: {e}", "red"))
+                    self.after(0, lambda e=e: self.log_message(f"Receive error: {e}", "red"))
                 time.sleep(0.5)
         
-        # Connection lost
         if self.running:
+            self.after(0, lambda: self.log_message("Connection lost", "red"))
             self.after(0, self.disconnect)
     
     def process_packet(self, pkt: Packet):
@@ -435,7 +439,7 @@ class DoSPGUIClient(ctk.CTk):
         elif pkt.type == EXIT:
             # Server disconnect request
             self.after(0, lambda: self.log_message("Server requested disconnect"))
-            self.running = False
+            self.after(0, self.disconnect)
         
         elif pkt.type == PING:
             # Respond to ping

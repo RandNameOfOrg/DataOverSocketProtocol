@@ -263,3 +263,4 @@ http-client.private.env.json
 .cursorindexingignore
 deploy.bat
 .idea
+RELEASE_NOTES*

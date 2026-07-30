@@ -22,12 +22,16 @@ dependencies = [
 
 [project.optional-dependencies]
 yaml = ["pyyaml"]
+wss = ["simple-websocket"]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = [
     "dosp*"
 ]
+
+[project.scripts]
+dosp-admin = "dosp.admin_cli:main"
 
 [build-system]
 requires = [

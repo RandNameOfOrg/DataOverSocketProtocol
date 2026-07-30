@@ -2,7 +2,29 @@
 
 ## Module: dosp.protocol
 
-Core protocol definitions, packet handling, and encryption utilities.
+Core protocol definitions, packet handling, encryption utilities, and identity functions.
+
+### Admin & Identity Functions
+
+```python
+get_client_hash() -> str
+```
+Generate a unique client identifier based on stable system hardware (MAC address + hostname + machine GUID). Cannot be overridden without modifying source code. Automatically called by `Client.__init__()`.
+
+```python
+generate_admin_token(username: str, password: str) -> str
+```
+Generate an admin auth token from username and password. Token = `sha256(username + ":" + password)`.
+
+**Example**:
+```python
+from dosp.protocol import generate_admin_token
+
+token = generate_admin_token("admin", "changeme")
+print(token)  # hex string, e.g. "5b3930222a..."
+```
+
+---
 
 ### Classes
 
@@ -229,6 +251,10 @@ ERR  = 0x12   # Error
 AIP  = 0x13   # Assign IP
 HSK  = 0x14   # Handshake
 HC2C = 0x15   # C2C Handshake prefix
+BCST = 0x16   # Broadcast (admin only)
+AUTH = 0x17   # Authenticate (admin token login)
+ADMIN = 0x18  # Admin command / response
+CLIENT_INFO = 0x19  # Client info (hash, metadata)
 ```
 
 #### Error Codes
@@ -307,6 +333,28 @@ do_c2c_handshake(c2c_vip: str | int, use_dh: bool = True) -> None
 Establish encrypted tunnel with another client.
 - `c2c_vip`: Target client's virtual IP
 - `use_dh`: Use Diffie-Hellman (recommended) vs legacy mode (unsupported by new version)
+
+```python
+get_client_hash() -> str
+```
+Return the auto-generated client hash (read-only). Used for server-side identification and banning.
+
+```python
+authenticate_admin(token: str) -> bool
+```
+Authenticate as server admin using an admin token. Returns `True` if server confirms admin privileges.
+
+```python
+broadcast(message: str) -> str | None
+```
+Send a broadcast message to all connected clients (admin only). Requires prior `authenticate_admin()`.
+Returns server response text or `None` on failure.
+
+```python
+admin_command(command: str) -> str | None
+```
+Send an admin command to the server. Requires prior `authenticate_admin()`.
+Returns server response text or `None` on failure.
 
 ```python
 close() -> None
@@ -408,6 +456,9 @@ DoSP(host: str = "0.0.0.0", port: int = 7744,
 - `peers: list[dict]` - Peer servers
 - `running: bool` - Server running status
 - `config: dict` - Server configuration
+- `server_packets_received: int` - Server-lifetime packet receive count
+- `server_packets_sent: int` - Server-lifetime packet send count
+- `admin_token_auto: str | None` - Auto-generated admin token (if none configured)
 
 **Methods**:
 
@@ -496,7 +547,35 @@ server.start()
 
 ### Configuration
 
-#### Server Config Dictionary
+#### `ServerConfig`
+
+Configuration dataclass used by `DoSP`.
+
+**Fields**:
+
+| Field | Default | Description |
+|---|---|---|
+| `host` | `"0.0.0.0"` | Server bind address |
+| `port` | `7744` | Server port |
+| `ip_template` | `"7.10.0.x"` | Virtual IP template |
+| `allow_local` | `False` | Allow LocalClient connections |
+| `allow_compression` | `False` | Enable zlib compression |
+| `peers` | `[]` | Peer server configurations |
+| `remote_servers_limit` | `64` | Max learned routes |
+| `max_hops` | `8` | Max forwarding hops |
+| `banned_ip_list` | `[0.0.0.0, 127.0.0.1]` | Blocked virtual IPs |
+| `clients_conf` | `[0x02, 0x0000]` | Version and server token |
+| `admin_tokens` | `[]` | List of valid admin auth tokens (auto-generates random if empty) |
+| `banned_hashes` | `[]` | List of banned client hashes |
+| `whitelist_hashes` | `[]` | List of whitelisted client hashes |
+| `hash_whitelist_enabled` | `False` | When True, only whitelisted hashes can connect |
+| `admin_token_file` | `None` | Path to write auto-generated admin token |
+| `wss_enabled` | `False` | Enable WebSocket Secure |
+| `wss_port` | `7745` | WSS listener port |
+| `wss_certfile` | `None` | TLS cert for WSS |
+| `wss_keyfile` | `None` | TLS key for WSS |
+
+#### Server Config Dictionary (legacy)
 
 ```python
 config = {
@@ -504,10 +583,10 @@ config = {
     "port": 7744,
     "ip_template": "7.10.0.{x}",
     "allow_local": False,
-    "peers": [],  # List of peer configurations
-    "remoteServers_limit": 64,  # Max learned routes
-    "max_hops": 8,  # Max forwarding hops
-    "clients_conf": [0x01, 0x0000]  # Version and token
+    "peers": [],
+    "remoteServers_limit": 64,
+    "max_hops": 8,
+    "clients_conf": [0x01, 0x0000]
 }
 ```
 
