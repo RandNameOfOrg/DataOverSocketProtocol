@@ -6,13 +6,17 @@ A modern graphical user interface for the DataOverSocketProtocol (DoSP) client b
 
 ## Features
 
-- 🔌 **Easy Connection**: Simple connection interface with server address and desired vIP
-- 💬 **Real-time Messaging**: Send and receive messages from server and other clients
-- 🔐 **Secure C2C Tunnels**: Establish encrypted client-to-client connections with a single click
-- 📋 **Client Discovery**: View all connected clients on the network
-- 🎨 **Modern UI**: Dark/light theme support with customtkinter
-- 📝 **Message History**: Scrollable message and log displays
-- ⚡ **Non-blocking**: Asynchronous message handling with threading
+- **Easy Connection**: Simple connection interface with server address and desired vIP
+- **Real-time Messaging**: Send and receive messages from server and other clients
+- **Secure C2C Tunnels**: Establish encrypted client-to-client connections with a single click
+- **Client Discovery**: View all connected clients on the network
+- **Client Sidebar**: Dedicated panel showing connected clients with click-to-target
+- **Admin Mode**: Authenticate with admin token and execute admin commands from the GUI
+- **Admin Commands**: Quick-action buttons for clients, stats, kick, ban, plus a custom command entry
+- **Broadcast**: Send broadcast messages to all connected clients (admin only)
+- **Modern UI**: Dark/light theme support with customtkinter
+- **Message History**: Scrollable message and log displays
+- **Non-blocking**: Asynchronous message handling with threading
 
 ## Installation
 
@@ -79,7 +83,12 @@ main()
 
 5. **View Connected Clients**
    - Click "Get Clients"
-   - Client list appears in messages area
+   - Client list appears in sidebar and in messages area
+
+6. **Admin Mode** (if you have an admin token)
+   - Enter your admin token in the "Token" field
+   - Click "Authenticate"
+   - Use the admin panel buttons or type custom commands
 
 ## Interface Overview
 
@@ -88,6 +97,8 @@ main()
 - **Desired vIP**: Request specific virtual IP (optional)
 - **Connect/Disconnect**: Toggle connection
 - **Status**: Shows connection status and current vIP
+- **Token**: Admin token entry for authentication
+- **Authenticate**: Authenticate as admin; enables admin panel and broadcast
 
 ### Target Panel
 - **Target**: Set message destination (server or client IP)
@@ -95,21 +106,37 @@ main()
 - **Establish C2C**: Create encrypted tunnel to target
 - **Get Clients**: Request list of connected clients
 
+### Admin Panel (visible after admin auth)
+- **Quick Action Buttons**: Clients list, Stats, Help
+- **Kick Entry**: Enter client vIP and click Kick to disconnect
+- **Ban Entry**: Enter client vIP and click Ban to ban by hash
+- **Custom Command**: Free-form admin command entry + Execute button
+
+### Client Sidebar
+- **Connected Clients**: Scrollable list of all connected clients
+- **Click-to-Target**: Click any client IP to set it as message target
+- **YOU indicator**: Shows which entry is your own client
+- **Refresh**: Manual refresh button
+
 ### Message Display
 - Shows all sent and received messages
 - Color-coded by message type:
-  - 📤 Sent messages
-  - 📨 Received messages
-  - 🔔 System notifications
+  - Sent messages
+  - Received messages
+  - System notifications (cyan)
+  - Admin responses (purple)
 
 ### Log Display
 - Shows protocol-level events
 - Connection status
 - Tunnel establishment
+- Admin operations
 - Errors and warnings
+- Collapsible (Hide/Show toggle)
 
 ### Input Area
 - Text entry for messages
+- **Broadcast** button (admin only, purple) - sends message to all connected clients
 - Send button
 - Enter key to send
 
@@ -136,15 +163,37 @@ The GUI handles various DoSP message types:
 - **PING**: Keep-alive messages (auto-responded)
 - **ERR**: Error messages from server
 - **EXIT**: Server disconnect requests
+- **AUTH**: Admin authentication response
+- **ADMIN**: Admin command response (shown with [ADMIN] prefix)
+- **BCST**: Broadcast confirmation
+
+### Admin Mode
+
+The GUI supports full admin functionality through the receive loop:
+
+1. **Authentication**: Enter the admin token and click "Authenticate". The token is sent as an AUTH packet; success enables the admin panel.
+
+2. **Admin Commands**: Two ways to send commands:
+   - **Quick Action Buttons**: Clients list, Server stats, Help
+   - **Kick/Ban Entries**: Enter a vIP and click the action button
+   - **Custom Command Entry**: Type any command (e.g., `block 7.10.0.5`, `whitelist-remove <hash>`, `whitelist-off`) and click Execute
+
+3. **Broadcast**: When admin, a purple "Broadcast" button appears next to Send. Type your message and click Broadcast to send it to all connected clients.
+
+4. **Architecture**: Admin packets are sent directly via the client socket. Responses are received by the main receive loop and routed via thread-safe events, avoiding conflicts with the concurrent receive thread.
 
 ### Threading Model
 
 - **Main Thread**: GUI updates and user interaction
 - **Connection Thread**: Background connection establishment
-- **Receiver Thread**: Continuous message reception
+- **Receiver Thread**: Continuous message reception; routes AUTH, ADMIN, BCST responses via thread-safe events
 - **Tunnel Thread**: Background C2C handshake
+- **Admin Auth Thread**: Background admin authentication
+- **Admin Command Thread**: Background admin command execution
+- **Broadcast Thread**: Background broadcast message sending
 
-All threads are daemon threads that terminate when the app closes.
+All worker threads are daemon threads that terminate when the app closes.
+Admin operations use `threading.Event` to synchronize responses from the receive loop without blocking it.
 
 ## Configuration
 

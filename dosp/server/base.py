@@ -1,5 +1,6 @@
 import logging
 import socket
+import struct
 import threading
 import time
 from hashlib import sha256
@@ -714,11 +715,11 @@ class DoSP:
             if rc:
                 rc.connected_at = time.time()
         if sock is not None:
-            pkt_aip = Packet(AIP, ip_int.to_bytes(4, 'big'))
-            pkt_hsk = Packet(HSK, self.config.allow_compression.to_bytes() + str(self.config.clients_conf).encode())
+            aip_payload = ip_int.to_bytes(4, 'big')
+            hsk_payload = self.config.allow_compression.to_bytes() + str(self.config.clients_conf).encode()
             try:
-                sock.sendall(pkt_aip.to_bytes())
-                sock.sendall(pkt_hsk.to_bytes())
+                sock.sendall(struct.pack(">BI", AIP, len(aip_payload)) + aip_payload)
+                sock.sendall(struct.pack(">BI", HSK, len(hsk_payload)) + hsk_payload)
             except Exception as e:
                 self.logger.error(f"Failed to send IP or config to {int_to_ip(ip_int)}: {e}")
 

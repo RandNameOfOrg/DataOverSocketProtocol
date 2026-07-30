@@ -189,11 +189,22 @@ def _main():
 
     if serve:
         from .server.base import ServerConfig
-        srv_cfg = ServerConfig(
-            host=host,
-            port=port,
-            ip_template=ip_template,
+        srv_kw = dict(
+            host=host, port=port, ip_template=ip_template,
         )
+        for k in ("allow_compression", "compression_level", "max_clients",
+                  "socket_timeout", "admin_tokens", "banned_hashes",
+                  "whitelist_hashes", "hash_whitelist_enabled",
+                  "admin_token_file", "max_packet_size"):
+            v = cfg.get(k)
+            if v is not None:
+                srv_kw[k] = v
+        bip = cfg.get("banned_ip_list")
+        if bip is not None:
+            srv_kw["banned_ip_list"] = [
+                ip_to_int(s) if isinstance(s, str) else s for s in bip
+            ]
+        srv_cfg = ServerConfig(**srv_kw)
         server = DoSP(srv_cfg)
         if peers:
             for peer_str in peers:

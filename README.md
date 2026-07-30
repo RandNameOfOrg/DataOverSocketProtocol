@@ -4,49 +4,55 @@
 
 **DoSP** (Data over socket Protocol) — TCP-протокол, работающий по умолчанию на порту `7744`. Используется для маршрутизации и пересылки сообщений между клиентами через сервера.
 
-# WARNING!
-> REPO GOAL CHANGED, just found out about yggdrasil, so now it will be used for secure access
-
 ## Для чего он нужен? (Why use this?)
-> Для удаленного доступа к удаленным серверам
+> Для удаленного доступа к удаленным серверам и создания mesh-сетей между ними.
 
 ---
 
-## 📦 Message Format
+## 📦 Packet Wire Format
 
 ```
-B = Byte(s)
-b = bit(s)  
-[2B TYPE] [4B LENGTH] [optional 4B DST_IP] [PAYLOAD]
-````
+[1B TYPE] [4B LENGTH (big-endian)] [PAYLOAD]
+```
 
-- `TYPE`: Тип сообщения (1 байт)
-- `LENGTH`: Длина пакета, включая payload и DST_IP (если присутствует)
-- `DST_IP`: Адрес получателя (если требуется)
-- `PAYLOAD`: Полезная нагрузка
+- `TYPE`: тип пакета (1 байт)
+- `LENGTH`: длина payload (сжатого, если compression включён)
+- `PAYLOAD`: полезная нагрузка
+
+**S2C (0x03)** payload: `[4B dst_ip][4B src_ip][compressed user data]`
+**Все остальные типы** payload: `[compressed user data]`
+
+Сжатие (zlib) включается runtime через `protocol.set_compression()`.
+Сервер рекламирует поддержку сжатия в HSK-пакете; клиент включает автоматически.
 
 ---
 
 ## 🔤 Message Types
 
-| Name   | Hex   | Description        |
-|--------|-------|--------------------|
-| `MSG`  | `x01` | Сообщение          |
-| `PING` | `x02` | Ping               |
-| `S2C`  | `x03` | Отправка другому   |
-| `GCL`  | `x04` | Получения клиентов |
-| `FN`   | `x05` | Запустить функцию  |
-| `SD`   | `x06` | Server Data        | 
-| `RQIP` | `x07` | Запрос IP          |
-| `GSI`  | `x08` | Получить self-info |
-| `SA`   | `x10` | Ответ сервера      |
-| `EXIT` | `x11` | Выход              |
-| `ERR`  | `x12` | Ошибка             |
-| `AIP`  | `x13` | Назначенный IP     |
-| `HSK`  | `x14` | HandShake          |
+| Name         | Hex   | Description                      |
+|--------------|-------|----------------------------------|
+| `MSG`        | `x01` | Сообщение                        |
+| `PING`       | `x02` | Ping                             |
+| `S2C`        | `x03` | Send to client (роутинг)         |
+| `GCL`        | `x04` | Get clients list                 |
+| `FN`         | `x05` | Run function                     |
+| `SD`         | `x06` | Server Data (peer advertisement) |
+| `RQIP`       | `x07` | Request IP                       |
+| `GSI`        | `x08` | Get self-info                    |
+| `SA`         | `x10` | Server answer                    |
+| `EXIT`       | `x11` | Exit / disconnect                |
+| `ERR`        | `x12` | Error                            |
+| `AIP`        | `x13` | Assign IP                        |
+| `HSK`        | `x14` | Handshake (config exchange)      |
+| `HC2C`       | `x15` | C2C handshake marker             |
+| `BCST`       | `x16` | Broadcast (admin only)           |
+| `AUTH`       | `x17` | Admin authentication             |
+| `ADMIN`      | `x18` | Admin command / response         |
+| `CLIENT_INFO`| `x19` | Client identity hash             |
+| `MPAK`       | `x1A` | Multi-packet aggregation         |
 
-types before 0x20 are reserved for build-in functions
-other types are reserved for future use
+Types before 0x20 are reserved for built-in functions.
+Types 0x20+ are available for custom use.
 ---
 
 ## 🌐 vIPv4 — Virtual IP v4
@@ -84,6 +90,8 @@ Interactive Message Client is client (made by [__themaster1970sf__](https://gith
 
 ## TODO
 
-- Make EXIT work fine on both client and server
-- make check_conection() working at client.py
-- add ip parsing at base.py (server)
+- Federation: cross-server peer routing via advertisements
+- E2E encryption for C2C tunnels (DH + MAC + replay protection) — done
+- Admin CLI (`dosp-admin`) — done
+- WebSocket transport (WSS/WS) — done
+- MPAK (multi-packet aggregation) — done
