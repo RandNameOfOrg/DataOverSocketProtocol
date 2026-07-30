@@ -3,8 +3,7 @@ import socket
 import threading
 from hashlib import sha256
 
-import pydantic
-from pydantic import Field
+from dataclasses import dataclass, field
 
 from dosp.protocol import *
 from dosp.protocol import ENABLE_COMPRESSION
@@ -46,21 +45,22 @@ class RemoteServer:
         return RemoteServer(host, port, tmpl, hop_count=hop), offset
 
 
-class ServerConfig(pydantic.BaseModel):
-    host: str = Field(default="0.0.0.0")
+@dataclass
+class ServerConfig:
+    host: str = "0.0.0.0"
     port: int = 7744
     ip_template: str = "7.10.0.x"
 
     allow_local: bool = False
     allow_compression: bool = ENABLE_COMPRESSION
-    peers: list[dict] = []
+    peers: list[dict] = field(default_factory=list)
     remote_servers_limit: int = 64
     max_hops: int = 8
-    banned_ip_list: list[int] = [ip_to_int("0.0.0.0"), ip_to_int("127.0.0.1")]
-    clients_conf: list = [
+    banned_ip_list: list[int] = field(default_factory=lambda: [ip_to_int("0.0.0.0"), ip_to_int("127.0.0.1")])
+    clients_conf: list = field(default_factory=lambda: [
         0x02,  # Version
         0x0000,  # Server token (allows to determine what types after 0x1F is)
-    ]
+    ])
     logger_name: str | None = None
 
 
