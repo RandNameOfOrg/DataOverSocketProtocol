@@ -38,6 +38,34 @@ Run it:
 python server.py
 ```
 
+**Or use the CLI** (no script needed):
+```bash
+# Start server on default port
+python -m dosp --serve
+
+# Custom host, port, and IP template
+python -m dosp --serve --host 0.0.0.0 --port 7744 --ip-template 7.34.43.x
+
+# With peer servers and debug logging
+python -m dosp --serve --port 7744 --peers 10.0.0.50:7744:7.10.0.x --debug
+
+# Run in background thread
+python -m dosp --serve --detach
+```
+
+**CLI arguments**:
+| Argument | Default | Description |
+|---|---|---|
+| `--serve` | — | Start the DoSP server |
+| `--host` | `0.0.0.0` | Server bind address |
+| `--port` | `7744` | Server port |
+| `--ip-template` | `7.10.0.x` | Virtual IP template |
+| `--peers` | — | Peer servers (`host:port:template`) |
+| `--debug` | — | Enable debug logging |
+| `--detach` | — | Run server in background thread |
+| `--client` | — | Interactive client mode |
+| `--vip` | — | Request a specific vIP in client mode |
+
 ## 2. Connect with GUI Client
 
 **Start GUI**:
@@ -141,6 +169,17 @@ with Client(host="127.0.0.1:7744", vip="7.10.0.3") as client_b:
 **Terminal Client**:
 ```bash
 python interactive_messager.py
+```
+
+**Or use the built-in CLI client**:
+```bash
+# Connect to default server
+python -m dosp --client
+
+# Custom host, port, and request a specific vIP
+python -m dosp --client --host 127.0.0.1 --port 7744 --vip 7.10.0.10
+
+# Commands: /send <vip> <message>, /exit, /quit
 ```
 
 **Commands**:
