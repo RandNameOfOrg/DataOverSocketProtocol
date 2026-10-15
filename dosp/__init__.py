@@ -2,7 +2,6 @@ from .iptools import ip_to_int, int_to_ip, ip_to_id
 from .protocol import *
 from .server import *
 from .client import Client
-from .admin_cli import main as admin_cli_main
 from .ws_transport import WebSocketTransport, WSServerConfig, ws_available
 
 
@@ -114,7 +113,7 @@ compression_level: 6
 
 # Limits
 max_clients: 256
-socket_timeout: 30.0    # seconds, 0 for blocking
+socket_timeout: 0.0     # seconds, 0 for blocking (no idle eviction)
 # max_packet_size: 65536  # bytes, 0 for unlimited
 
 # Admin

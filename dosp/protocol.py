@@ -4,6 +4,7 @@ import logging
 import os
 import socket
 import struct
+import threading
 from abc import ABC
 
 from Crypto.Cipher import AES
@@ -22,9 +23,39 @@ except ImportError:
 
 # Start with compression disabled (no-op)
 from types import SimpleNamespace
+
+
+class CompressionState:
+    """Per-connection compression configuration.
+
+    Each Client/Server owns its own instance so multiple connections with
+    different compression settings can coexist in the same process without
+    stomping on each other's packet serialization (the old module-global
+    approach was not thread-safe).
+    """
+    __slots__ = ("enabled", "level")
+
+    def __init__(self, enabled: bool = False, level: int = 6):
+        self.enabled = bool(enabled)
+        self.level = max(1, min(9, level))
+
+    def compress(self, data: bytes) -> bytes:
+        if self.enabled and _zlib_available:
+            return _real_zlib.compress(data, self.level)
+        return data
+
+    def decompress(self, data: bytes) -> bytes:
+        if self.enabled and _zlib_available:
+            return _real_zlib.decompress(data)
+        return data
+
+
+# Module-level default used when no explicit CompressionState is passed to
+# Packet.to_bytes()/from_socket() (backward compatibility).
+_default_compression = CompressionState()
+
+# Backward-compat global namespace whose behavior mirrors _default_compression.
 zlib = SimpleNamespace()
-zlib.compress = lambda data: data
-zlib.decompress = lambda data: data
 compression_enabled = False
 compression_level = 6
 
@@ -32,24 +63,26 @@ compression_level = 6
 ENABLE_COMPRESSION = False
 
 
-def set_compression(enabled: bool, level: int = 6):
-    """Enable or disable zlib compression at runtime.
-    Affects all subsequent Packet.to_bytes() and Packet.from_socket() calls.
-    """
+def _refresh_default_compression():
     global zlib, compression_enabled, compression_level, ENABLE_COMPRESSION
-    compression_enabled = enabled
-    compression_level = max(1, min(9, level))
-    if enabled and _zlib_available:
-        _real_level = compression_level
+    zlib.compress = _default_compression.compress
+    zlib.decompress = _default_compression.decompress
+    compression_enabled = _default_compression.enabled
+    compression_level = _default_compression.level
+    ENABLE_COMPRESSION = _default_compression.enabled
 
-        def _compress(data):
-            return _real_zlib.compress(data, _real_level)
-        zlib.compress = _compress
-        zlib.decompress = _real_zlib.decompress
-    else:
-        zlib.compress = lambda data: data
-        zlib.decompress = lambda data: data
-    ENABLE_COMPRESSION = enabled
+
+_refresh_default_compression()
+
+
+def set_compression(enabled: bool, level: int = 6):
+    """Enable or disable zlib compression for the module-level default state.
+    Affects Packet.to_bytes()/from_socket() calls that don't pass an explicit
+    CompressionState. Prefer a per-connection CompressionState for new code.
+    """
+    _default_compression.enabled = bool(enabled)
+    _default_compression.level = max(1, min(9, level))
+    _refresh_default_compression()
 
 # region PacketTypes
 MSG = 0x01  # Message
@@ -117,6 +150,7 @@ class ERR_CODES:
     AIPF = 0x07
     HSKF = 0x08
     UKNP = 0x09
+    UNREACHABLE = 0x0A  # Client unreachable
 
     code_to_error = {
         FNF: "Function not found",
@@ -127,7 +161,8 @@ class ERR_CODES:
         GCLF: "Get clients list failed",
         AIPF: "Assign IP failed",
         HSKF: "Handshake failed",
-        UKNP: "Unknown packet type"
+        UKNP: "Unknown packet type",
+        UNREACHABLE: "Client unreachable"
     }
 
     def __getitem__(self, key):
@@ -155,6 +190,27 @@ def recv_exact(sock, size: int) -> bytes | None:
             return None
         buf += part
     return buf
+
+
+def recv_packet_raw(sock):
+    """Read a packet from socket without decompression.
+    Used for AIP/HSK handshake packets which are sent uncompressed.
+    Returns Packet with raw (uncompressed) payload.
+    """
+    header = recv_exact(sock, 5)
+    if not header:
+        return None
+    type_, length = struct.unpack(">BI", header)
+    data = recv_exact(sock, length)
+    if data is None:
+        return None
+    if type_ == S2C:
+        if len(data) < 8:
+            return None
+        dst_ip = struct.unpack(">I", data[:4])[0]
+        src_ip = struct.unpack(">I", data[4:8])[0]
+        return Packet(type_, data[8:], dst_ip=dst_ip, src_ip=src_ip)
+    return Packet(type_, data)
 
 
 def encrypt(data: bytes, key: bytes) -> bytes:
@@ -194,9 +250,12 @@ def decrypt(data: bytes, key: bytes) -> bytes:
 
 
 def get_client_hash() -> str:
-    """Generate a unique client identifier based on stable system hardware info.
-    Uses MAC address, hostname, and machine ID.
-    Cannot be overridden externally without modifying this source code.
+    """Generate a stable client *identifier* from system hardware info.
+
+    Uses MAC address, hostname, and machine ID, hashed with SHA256. This is an
+    identifier, NOT a secret: it is deterministic and anyone who knows the same
+    hardware facts can reproduce it. Do not treat it as an authentication
+    credential. It also encodes machine-identifying data, so avoid sharing it.
     """
     import platform
     import uuid
@@ -223,12 +282,60 @@ def get_client_hash() -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
-def generate_admin_token(username: str, password: str) -> str:
-    """Generate an admin auth token from username and password.
-    Token = sha256(username + ':' + password)
+ADMIN_TOKEN_PREFIX = "pbkdf2_sha256"
+ADMIN_TOKEN_ITERATIONS = 200_000
+
+
+def _admin_token_salt(username: str) -> bytes:
+    """Deterministic per-user salt.
+
+    A deterministic salt keeps ``generate_admin_token`` reproducible so the
+    ``--login user pass`` flow and configured tokens keep matching, while still
+    defeating global precomputed (rainbow) tables.
     """
-    raw = f"{username}:{password}"
-    return hashlib.sha256(raw.encode()).hexdigest()
+    return hashlib.sha256(f"dosp-admin-salt:{username}".encode()).digest()[:16]
+
+
+def generate_admin_token(username: str, password: str, salt: bytes | None = None) -> str:
+    """Generate a salted, slow-hashed admin token from username and password.
+
+    Format: ``pbkdf2_sha256$<iterations>$<salt_hex>$<hash_hex>``.
+
+    PBKDF2-HMAC-SHA256 with a per-user salt is used instead of a bare SHA256,
+    so a leaked token file cannot be cracked with precomputed tables.
+    """
+    if salt is None:
+        salt = _admin_token_salt(username)
+    raw = f"{username}:{password}".encode()
+    dk = hashlib.pbkdf2_hmac("sha256", raw, salt, ADMIN_TOKEN_ITERATIONS)
+    return f"{ADMIN_TOKEN_PREFIX}${ADMIN_TOKEN_ITERATIONS}${salt.hex()}${dk.hex()}"
+
+
+def verify_admin_token(token: str, stored: str) -> bool:
+    """Constant-time verification of an admin token against a stored value.
+
+    Accepts either the stored token string itself (bearer model, what
+    ``generate_admin_token`` returns and the client sends) or the raw
+    ``username:password`` secret (which is re-derived and compared). Legacy
+    plain tokens (random hex) are compared directly. All comparisons are
+    constant-time.
+    """
+    if not token or not stored:
+        return False
+    # Bearer model: the configured token is presented verbatim.
+    if hmac.compare_digest(token, stored):
+        return True
+    # Password model: derive from the presented secret and compare.
+    if stored.startswith(ADMIN_TOKEN_PREFIX + "$"):
+        try:
+            _, iterations, salt_hex, hash_hex = stored.split("$", 3)
+            dk = hashlib.pbkdf2_hmac(
+                "sha256", token.encode(), bytes.fromhex(salt_hex), int(iterations)
+            )
+            return hmac.compare_digest(dk.hex(), hash_hex)
+        except Exception:
+            return False
+    return False
 
 
 def derive_tunnel_keys(shared_secret: bytes, info: bytes = b'dosp-c2c-v1') -> dict:
@@ -259,9 +366,11 @@ class Packet:
         self.src_ip = src_ip
         self.encryption_key = encryption_key
         self._cached_bytes = None
+        self._cached_key = None
 
     def clear_cache(self):
         self._cached_bytes = None
+        self._cached_key = None
 
     def _serialize_sub(self) -> bytes:
         """Serialize packet body for MPAK sub-packet (no compression, raw format)."""
@@ -288,7 +397,9 @@ class Packet:
         Only valid for MPAK type packets.
         """
         if self.type != MPAK:
-            raise ValueError("Packet is not MPAK")
+            raise ValueError(
+                f"Packet is not MPAK (type={packetTypes.get(self.type, hex(self.type))})"
+            )
         data = self.payload
         packets = []
         offset = 0
@@ -308,36 +419,57 @@ class Packet:
                 packets.append(Packet(sub_type, payload))
         return packets
 
-    def to_bytes(self) -> bytes:
-        if self._cached_bytes:
+    def to_bytes(self, compression: CompressionState | None = None) -> bytes:
+        if compression is None:
+            compression = _default_compression
+        # Encrypted packets must never be cached: re-encoding must produce a
+        # fresh AES-GCM nonce. Caching them (or reusing cached ciphertext across
+        # sends) risks catastrophic nonce reuse if the plaintext ever changes.
+        cacheable = self.encryption_key is None
+        cache_key = (id(compression), compression.enabled, compression.level)
+        if cacheable and self._cached_bytes is not None and self._cached_key == cache_key:
             return self._cached_bytes
 
         if self.type == S2C:
             if self.dst_ip is None:
                 raise ValueError("dst_ip required for type S2C")
+            payload = self.payload
             if self.encryption_key is not None:
-                self.payload = encrypt(self.payload, self.encryption_key)
+                # Encrypt into a local variable; do not mutate self.payload.
+                payload = encrypt(payload, self.encryption_key)
             dst_bytes = struct.pack(">I", self.dst_ip)
             src_bytes = struct.pack(">I", self.src_ip or 0)
 
             # compress only data (destination, src ip and payload)
-            pre_payload = dst_bytes + src_bytes + self.payload
-            total_payload = zlib.compress(pre_payload)
+            pre_payload = dst_bytes + src_bytes + payload
+            total_payload = compression.compress(pre_payload)
             header = struct.pack(">BI", self.type, len(total_payload))
-            self._cached_bytes = header + total_payload
-            return header + total_payload
+            result = header + total_payload
         else:
-            payload = zlib.compress(self.payload)
+            payload = compression.compress(self.payload)
             header = struct.pack(">BI", self.type, len(payload))
-            self._cached_bytes = header + payload
-            return header + payload
+            result = header + payload
+
+        if cacheable:
+            self._cached_bytes = result
+            self._cached_key = cache_key
+        return result
 
     @staticmethod
-    def from_socket(sock, src_ip: int = None, raise_on_error: bool = False, encryption_key=None) -> 'Packet | None':
+    def from_socket(sock, src_ip: int = None, raise_on_error: bool = False,
+                    compression: CompressionState | None = None) -> 'Packet | None':
         """
+        Read a single packet off the wire.
+
+        Note: C2C/tunneled payloads are NOT decrypted here. For S2C the first
+        8 bytes are the routing header, and tunnel decryption is performed by
+        ``TunneledClient.decrypt`` once the routing header has been stripped.
+
         :raises PacketError
         :raises VNetError
         """
+        if compression is None:
+            compression = _default_compression
         header = recv_exact(sock, 5)
         if not header:
             if raise_on_error:
@@ -351,16 +483,7 @@ class Packet:
             if raise_on_error:
                 raise VNetError("failed to receive packet data")
             return None
-        data = zlib.decompress(data)
-
-        # For tunneled packets (S2C), do not attempt to decrypt here, as the payload header contains routing info
-        if encryption_key and type_ in encryptedTypes and type_ != S2C:
-            try:
-                data = decrypt(data, encryption_key)
-            except ValueError as e:
-                if raise_on_error:
-                    raise PacketError(f"Decryption failed: {e}")
-                return None
+        data = compression.decompress(data)
 
         if type_ == S2C:
             if len(data) < 8:
@@ -379,10 +502,16 @@ class Packet:
         return len(self.to_bytes())
 
     def __str__(self) -> str:
-        base = f"type={packetTypes[self.type]}, payload={self.payload[:50]}{'...' if len(self.payload) > 50 else ''}, encrypted={self.encryption_key is not None}"
-        if self.dst_ip is None:
-            return f"Packet({base})"
-        return f"Packet({base}, dst_ip={int_to_ip(self.dst_ip)})"
+        type_name = packetTypes.get(self.type, hex(self.type))
+        base = f"type={type_name}, payload={self.payload[:50]}{'...' if len(self.payload) > 50 else ''}, encrypted={self.encryption_key is not None}"
+        extra = []
+        if self.dst_ip is not None:
+            extra.append(f"dst_ip={int_to_ip(self.dst_ip)}")
+        if self.src_ip is not None:
+            extra.append(f"src_ip={int_to_ip(self.src_ip)}")
+        if extra:
+            return f"Packet({base}, {', '.join(extra)})"
+        return f"Packet({base})"
 
 
 class IClient(ABC):
@@ -398,13 +527,18 @@ class RemoteClient(IClient):
     def __init__(self, sock: socket.socket | None,
                  ip: int, logger: logging.Logger,
                  allow_local=False,
-                 encryption_key=None) -> None:
+                 encryption_key=None,
+                 compression: CompressionState | None = None) -> None:
         if not allow_local and sock is None:
             raise HandshakeError("local connection not allowed")
 
         self.sock = sock
         self.ip = ip
         self.logger = logger
+        self.compression = compression
+        # Serializes writes from the per-client handler thread and from server
+        # broadcasts / disconnect notifications so frames don't interleave.
+        self._send_lock = threading.Lock()
         self.message_queue: list[Packet] = []
         self.should_disconnect = False
 
@@ -421,15 +555,22 @@ class RemoteClient(IClient):
         self.packets_received: int = 0
         self.packets_sent: int = 0
 
+        # Exit metadata captured from an EXIT packet, reported once by the
+        # connection handler so a clean exit is not double-notified.
+        self.exit_code: str = ""
+        self.exit_reason: str | None = None
+
     def send(self, pkt: Packet) -> None:
         if self.sock is not None:
-            self.sock.sendall(pkt.to_bytes())
+            data = pkt.to_bytes(self.compression)
+            with self._send_lock:
+                self.sock.sendall(data)
         else:
             self.message_queue.append(pkt)
 
     def receive(self) -> Packet | None:
         if self.sock is not None:
-            return Packet.from_socket(self.sock)
+            return Packet.from_socket(self.sock, compression=self.compression)
         if self.message_queue:
             return self.message_queue.pop(0)
         return None
@@ -446,10 +587,16 @@ class TunneledClient(IClient):
 
     def __init__(self, ip: int, logger: logging.Logger,
                  encryption_key=None, sock: socket.socket | None = None,
-                 use_dh: bool = False, private_key=None):
+                 use_dh: bool = False, private_key=None,
+                 compression: CompressionState | None = None,
+                 send_lock=None):
         self.sock = sock
         self.ip = ip
         self.logger = logger
+        self.compression = compression
+        # Shared with the owning Client so concurrent sends cannot interleave
+        # partial frames on the single connection socket.
+        self.send_lock = send_lock
         self.message_queue = []  # For local communication
 
         # Security parameters
@@ -565,7 +712,12 @@ class TunneledClient(IClient):
             encrypted_pkt = Packet(pkt.type, authenticated_data, pkt.dst_ip, pkt.src_ip)
 
             if self.sock is not None:
-                self.sock.sendall(encrypted_pkt.to_bytes())
+                data = encrypted_pkt.to_bytes(self.compression)
+                if self.send_lock is not None:
+                    with self.send_lock:
+                        self.sock.sendall(data)
+                else:
+                    self.sock.sendall(data)
             else:
                 # For local communication
                 self.message_queue.append(encrypted_pkt)
@@ -584,7 +736,7 @@ class TunneledClient(IClient):
 
         try:
             if self.sock is not None:
-                raw_pkt = Packet.from_socket(self.sock)
+                raw_pkt = Packet.from_socket(self.sock, compression=self.compression)
                 if raw_pkt is None:
                     return None
             else:
@@ -634,10 +786,11 @@ class HandshakeError(VNetError):
 
 
 __all__ = [
-              'Packet', 'recv_exact',
+              'Packet', 'recv_exact', 'recv_packet_raw',
               'ERR_CODES', 'VNetError', 'HandshakeError', 'PacketError',
               "encrypt", "decrypt", "RemoteClient", "TunneledClient",
               "encryptedTypes", "packetTypes", "ClientExitCodes",
               "derive_tunnel_keys", "MAC_SIZE", "GCM_NONCE_SIZE",
-              "get_client_hash", "generate_admin_token"
+              "get_client_hash", "generate_admin_token", "verify_admin_token",
+              "CompressionState"
           ] + [x for x in packetTypes.keys() if not isinstance(x, int)]

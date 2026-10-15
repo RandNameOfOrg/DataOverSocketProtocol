@@ -62,7 +62,9 @@ class ServerConfig:
     allow_compression: bool = False
     compression_level: int = 6
     max_packet_size: int = 0
-    socket_timeout: float = 30.0
+    # 0 = blocking (no idle eviction). A non-zero value is a per-recv timeout:
+    # an idle client is disconnected once it stays silent for that long.
+    socket_timeout: float = 0.0
     max_clients: int = 256
     peers: list[dict] = field(default_factory=list)
     remote_servers_limit: int = 64
@@ -90,7 +92,6 @@ class ServerConfig:
 
 
 class DoSP:
-    running = True
     dev_mode = False
 
     logger: logging.Logger = logging.getLogger(__name__)
@@ -174,9 +175,14 @@ class DoSP:
             )
         self.host = self.config.host
         self.port = self.config.port
+        self.ip_template = self.config.ip_template
         self.clients: dict[int, RemoteClient] = {}
         self.lock = threading.Lock()
         self.assigned_ids = set()
+        # VIPs whose disconnect has already been announced, so a single
+        # departure is not reported twice (e.g. EXIT handler + connection
+        # teardown). Cleared when the VIP is handed to a new client.
+        self._disconnect_notified: set[int] = set()
 
         # Peer servers state
         self.peers: list[dict] = []  # each: {host, port, ip_template, sock?, lock?}
@@ -199,6 +205,8 @@ class DoSP:
         self.server_packets_received: int = 0
         self.server_packets_sent: int = 0
 
+        self.running = True
+
         # Auto-generate admin token if none configured
         if not self.config.admin_tokens:
             import secrets
@@ -212,14 +220,18 @@ class DoSP:
                 except Exception as e:
                     self.logger.warning(f"Could not write admin token file: {e}")
 
-        # Apply runtime compression config
+        # Apply per-server compression state (independent of other DoSP
+        # instances in the same process; the old module-global set_compression
+        # approach was not thread-safe across multiple servers/clients).
+        self.compression = CompressionState(
+            enabled=self.config.allow_compression,
+            level=self.config.compression_level,
+        )
         if self.config.allow_compression:
-            from dosp.protocol import set_compression
-            set_compression(True, self.config.compression_level)
             self.logger.info(f"Compression enabled (level={self.config.compression_level})")
-        else:
-            from dosp.protocol import set_compression
-            set_compression(False)
+        # Peer-to-peer traffic is always uncompressed for determinism
+        # (there is no compression negotiation on peer links).
+        self.peer_compression = CompressionState(enabled=False)
 
         # Forwarding loop-prevention TTL store: key -> remaining hops
         self._forward_ttl: dict[tuple[int, int], int] = {}  # (dst_ip, digest) -> ttl
@@ -309,6 +321,10 @@ class DoSP:
         s.settimeout(5)
         try:
             s.connect((peer["host"], peer["port"]))
+            # The connect timeout must not persist: a persistent timeout would
+            # make the reader treat an idle (but healthy) peer link as dead.
+            s.settimeout(None)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             # Start a background reader to drain any responses
             threading.Thread(target=self._peer_reader, args=(idx, s), daemon=True).start()
             self.peer_socks[idx] = s
@@ -333,7 +349,11 @@ class DoSP:
         """Read packets from peer. Handle SD and S2C forwarding with loop prevention."""
         try:
             while self.running:
-                pkt = Packet.from_socket(s)
+                try:
+                    pkt = Packet.from_socket(s, compression=self.peer_compression)
+                except socket.timeout:
+                    # Idle peer link: keep waiting rather than dropping it.
+                    continue
                 if pkt is None:
                     break
                 if pkt.type == SD:
@@ -433,7 +453,7 @@ class DoSP:
                 continue
             try:
                 with self.peer_locks[peer_idx]:
-                    psock.sendall(Packet(S2C, payload, dst_ip=dst_ip, src_ip=src_ip).to_bytes())
+                    psock.sendall(Packet(S2C, payload, dst_ip=dst_ip, src_ip=src_ip).to_bytes(self.peer_compression))
                 self._decrement_ttl(dst_ip, digest)
                 try:
                     self.logger.info(
@@ -484,7 +504,7 @@ class DoSP:
         payload = self._build_advertisement_payload()
         try:
             with self.peer_locks[peer_idx]:
-                psock.sendall(Packet(SD, payload).to_bytes())
+                psock.sendall(Packet(SD, payload).to_bytes(self.peer_compression))
         except Exception as e:
             self.logger.debug(f"Sending advertisement to peer[{peer_idx}] failed: {e}")
 
@@ -547,11 +567,14 @@ class DoSP:
         with self.lock:
             ip_num = 2
             while True:
+                if ip_num > 255:
+                    raise VNetError("no free virtual IPs left in template")
                 if ip_num not in self.assigned_ids:
                     ip_str = self.config.ip_template.replace("x", str(ip_num))
                     ip_int = ip_to_int(ip_str)
                     if ip_int not in self.clients:
                         self.assigned_ids.add(ip_num)
+                        self._disconnect_notified.discard(ip_int)
                         return ip_int, ip_num
                 ip_num += 1
 
@@ -561,6 +584,12 @@ class DoSP:
         :param detach: Run as Thread or not (if False locks code execution).
         :return: Thread if detach else None
         """
+        # Allow restarting a server that was previously stopped: reset the
+        # running flag and recreate the listening socket if it was closed.
+        self.running = True
+        if self.sock.fileno() == -1:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
         # Initialize configured peers
         try:
             for peer in list(self.config.peers):
@@ -607,6 +636,9 @@ class DoSP:
                     self.stop()
                     break
                 except Exception as e:
+                    # Socket was closed by stop() while blocked in accept()
+                    if not self.running:
+                        break
                     self.logger.error(f"Accept error: {e}")
 
         if not detach:
@@ -627,8 +659,20 @@ class DoSP:
 
     def stop(self):
         """sends a close packet to all clients and stops the server"""
-        for client in self.clients.values():
-            client.send(Packet(EXIT, b""))
+        # Notify remaining clients about each disconnecting peer so they can
+        # clean up stale C2C tunnels before the EXIT packet arrives.
+        # Snapshot: client threads may pop entries concurrently as they process
+        # the EXIT packets below.
+        for ip_int in list(self.clients.keys()):
+            try:
+                self.on_disconnect(ip_int)
+            except Exception as e:
+                self.logger.error(f"Failed to notify about {int_to_ip(ip_int)} disconnect: {e}")
+        for client in list(self.clients.values()):
+            try:
+                client.send(Packet(EXIT, b""))
+            except Exception:
+                pass
         # Close peer sockets
         try:
             for psock in list(getattr(self, 'peer_socks', []) or []):
@@ -647,7 +691,7 @@ class DoSP:
                 pass
         self.running = False
 
-    def handle_client(self, sock: socket.socket):
+    def handle_client(self, sock: socket.socket | WebSocketTransport):
         """
         Handles a single client connection.
 
@@ -663,8 +707,13 @@ class DoSP:
         If any other exception is raised, it is caught and logged, and the
         client's virtual IP address is removed from the server's internal state.
 
-        :param sock: The socket object of the client connection.
+        :param sock: The socket object (or WebSocket transport) of the client connection.
         """
+        if sock is not None:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            except Exception:
+                pass
         if self.config.socket_timeout > 0 and sock is not None:
             sock.settimeout(self.config.socket_timeout)
         with self.lock:
@@ -672,14 +721,15 @@ class DoSP:
                 self.logger.warning("Max clients reached, rejecting connection")
                 if sock is not None:
                     try:
-                        sock.sendall(Packet(EXIT, b"Server full").to_bytes())
+                        # Rejection happens before the HSK, so it must be uncompressed.
+                        sock.sendall(Packet(EXIT, b"Server full").to_bytes(CompressionState()))
                     except Exception:
                         pass
                     sock.close()
                 return
         ip_int, ip_id = self._next_ip()
         with self.lock:
-            self.clients[ip_int] = RemoteClient(sock, ip_int, self.logger)
+            self.clients[ip_int] = RemoteClient(sock, ip_int, self.logger, compression=self.compression)
         try:
             self.on_connect(sock, ip_int)
             while True:
@@ -688,7 +738,7 @@ class DoSP:
                     rc = self.clients.get(ip_int)
                     if rc is None or rc.should_disconnect:
                         break
-                pkt = Packet.from_socket(sock, src_ip=ip_int)
+                pkt = Packet.from_socket(sock, src_ip=ip_int, compression=self.compression)
                 if pkt is None:
                     break
                 if pkt.type == MPAK:
@@ -698,15 +748,20 @@ class DoSP:
                     self.handle_packet(pkt, sock, ip_int)
         except ConnectionResetError:
             self.logger.info(f"Client {int_to_ip(ip_int)} forcibly closed the connection")
+        except socket.timeout:
+            self.logger.info(f"Client {int_to_ip(ip_int)} idle timeout ({self.config.socket_timeout}s)")
         except Exception as e:
             self.logger.error(f"Error with client {int_to_ip(ip_int)}: {e}")
         finally:
+            with self.lock:
+                rc_left = self.clients.pop(ip_int, None)
+                self.assigned_ids.discard(ip_id)
+                self._admin_clients.discard(ip_int)
             if sock:
                 sock.close()
-            with self.lock:
-                self.clients.pop(ip_int, None)
-                self.assigned_ids.discard(ip_id)
-            self.on_disconnect(ip_int)
+            code = rc_left.exit_code if rc_left else ""
+            reason = rc_left.exit_reason if rc_left else None
+            self.on_disconnect(ip_int, code=code, reason=reason)
 
     def on_connect(self, sock: socket.socket, ip_int: int):
         self.logger.info(f"Client connected: {int_to_ip(ip_int)}")
@@ -730,7 +785,8 @@ class DoSP:
 
         ip_int, ip_id = self._next_ip()
         with self.lock:
-            self.clients[ip_int] = RemoteClient(None, ip_int, self.logger, allow_local=True)
+            self.clients[ip_int] = RemoteClient(None, ip_int, self.logger, allow_local=True,
+                                                compression=self.compression)
         try:
             self.on_connect(None, ip_int)
             return ip_int
@@ -742,6 +798,13 @@ class DoSP:
             raise HandshakeError("local connection failed")
 
     def on_disconnect(self, ip_int: int, code: str = "", reason: str = None):
+        # Announce each departure exactly once, even if multiple teardown paths
+        # (EXIT packet, admin kick, server stop) race to report the same client.
+        with self.lock:
+            if ip_int in self._disconnect_notified:
+                return
+            self._disconnect_notified.add(ip_int)
+            self._admin_clients.discard(ip_int)
         self.logger.info(f"Client disconnected: {int_to_ip(ip_int)}")
         label_map = {
             "CC": "Just exited",
@@ -754,6 +817,18 @@ class DoSP:
             self.logger.info(f"Client {int_to_ip(ip_int)} disconnected: {reason} ({label})")
         else:
             self.logger.info(f"Client {int_to_ip(ip_int)} disconnected: {label}")
+        # Notify all remaining clients so they can clean up C2C tunnels
+        err_payload = bytes([ERR_CODES.UNREACHABLE]) + struct.pack(">I", ip_int) + b"Client disconnected"
+        with self.lock:
+            for vip, rc in list(self.clients.items()):
+                if vip == ip_int:
+                    continue
+                try:
+                    rc.send(Packet(ERR, err_payload))
+                    rc.packets_sent += 1
+                    self.server_packets_sent += 1
+                except Exception as e:
+                    self.logger.error(f"Failed to notify {int_to_ip(vip)} about disconnect: {e}")
 
     def on_function(self, function_name: str, ip_int: int) -> tuple[bool, str]:
         self.logger.info(f"Running function from {int_to_ip(ip_int)}: {function_name}")
@@ -1012,8 +1087,11 @@ class DoSP:
             parts = pkt.payload.decode(errors='ignore').strip().split(",", 1)
             code = parts[0] if len(parts) > 0 else ""
             reason = parts[1] if len(parts) > 1 else None
-            self.on_disconnect(ip_int, code=code, reason=reason)
+            # Record the exit metadata; the connection handler reports the
+            # disconnect once in its teardown to avoid a duplicate broadcast.
             if src_rc:
+                src_rc.exit_code = code
+                src_rc.exit_reason = reason
                 src_rc.should_disconnect = True
         elif pkt.type == PING:
             reply(Packet(PING, b""))
@@ -1028,10 +1106,14 @@ class DoSP:
                     self.server_packets_sent += 1
                 except Exception as e:
                     self.logger.error(f"Failed to route to {int_to_ip(dst_ip)}: {e}")
+                    err_payload = bytes([ERR_CODES.UNREACHABLE]) + struct.pack(">I", dst_ip) + b"Client unreachable"
+                    reply(Packet(ERR, err_payload))
             else:
                 forwarded = self._forward_s2c(dst_ip, src_ip, pkt.payload)
                 if not forwarded:
                     self.logger.warning(f"No client or peer for IP {int_to_ip(dst_ip)} or TTL exhausted")
+                    err_payload = bytes([ERR_CODES.UNREACHABLE]) + struct.pack(">I", dst_ip) + b"Client unreachable"
+                    reply(Packet(ERR, err_payload))
         elif pkt.type == FN:
             done, msg = self.on_function(pkt.payload.decode(), ip_int)
             if not done:
@@ -1064,7 +1146,7 @@ class DoSP:
             if not src_rc:
                 return
             token = pkt.payload.decode(errors='ignore').strip()
-            if token in self.config.admin_tokens:
+            if any(verify_admin_token(token, stored) for stored in self.config.admin_tokens):
                 self._admin_clients.add(ip_int)
                 src_rc.is_admin = True
                 self.logger.info(f"Client {int_to_ip(ip_int)} authenticated as admin")
@@ -1114,21 +1196,27 @@ class DoSP:
                 self.logger.warning(f"IP {int_to_ip(new_ip)} is in block list")
                 reply(Packet(RQIP, b"E:IP can't be used"))
                 return
-            if new_ip in self.assigned_ids:
+            if new_ip in self.clients:
                 self.logger.warning(f"IP {int_to_ip(new_ip)} is already assigned to {int_to_ip(ip_int)}")
                 reply(Packet(RQIP, b"E:IP already in use"))
                 return
-            try:
-                with self.lock:
-                    if ip_int in self.assigned_ids:
-                        self.assigned_ids.remove(ip_int)
-                    client_obj = self.clients.pop(ip_int, None)
+            # Compute ip_num values from template x position
+            template_parts = self.config.ip_template.split('.')
+            x_idx = template_parts.index('x')
+            old_ip_num = int(int_to_ip(ip_int).split('.')[x_idx])
+            new_ip_num = int(int_to_ip(new_ip).split('.')[x_idx])
+            with self.lock:
+                client_obj = self.clients.pop(ip_int, None)
+                if client_obj is not None:
+                    self.assigned_ids.discard(old_ip_num)
+                    client_obj.ip = new_ip
                     self.clients[new_ip] = client_obj
-                    self.assigned_ids.add(new_ip)
-            except Exception as e:
-                print("Failed to rewrite client id:", e)
-            finally:
-                self.on_disconnect(new_ip)
+                    self.assigned_ids.add(new_ip_num)
+                    self._disconnect_notified.discard(new_ip)
+            if client_obj is None:
+                # Client vanished mid-request; don't insert a None entry.
+                reply(Packet(RQIP, b"E:Client state error"))
+                return
             reply(Packet(RQIP, b"D:"))
             reply(Packet(AIP, new_ip.to_bytes(4, 'big')))
             self.logger.debug(f"[{int_to_ip(ip_int)}] got new vIP {int_to_ip(new_ip)}")

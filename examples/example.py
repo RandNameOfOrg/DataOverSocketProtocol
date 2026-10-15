@@ -45,8 +45,10 @@ packet = Packet(MSG, heavy_packet_text)
 with Client(host="10.0.0.50", port=7744) as client:
     print("vIP:", int_to_ip(client.vip_int))
     start = time.time()
-    for _ in range(test_packet_num):
-        client.send(packet)
+    # for _ in range(test_packet_num):
+    #     client.send(packet)
+    # max_chunk_size limits uncompressed sub-packet payload per MPAK (~1MB)
+    client.send_multi([packet]*test_packet_num, max_chunk_size=1_048_576)
     end = time.time()
     client.close()
     print("Time elapsed:", end - start)

@@ -28,5 +28,8 @@ def ip_to_id(ip: str | int) -> int | None:
     if isinstance(ip, str) and len(ip.split('.')) == 4:
         return int(ip.split('.')[-1])
     elif isinstance(ip, int):
-        return int(int_to_ip(ip).split(".")[-1])
+        ip_str = int_to_ip(ip)
+        if ip_str is None:
+            return None
+        return int(ip_str.split(".")[-1])
     return None

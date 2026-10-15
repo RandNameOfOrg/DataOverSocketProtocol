@@ -188,52 +188,46 @@ class InteractiveMessageClient:
 
 # Простая версия для быстрого старта
 def simple_interactive_client():
-        """Простая интерактивная версия"""
-    # try:
-        with Client(host="127.0.0.1", vip="7.10.0.1") as client:
-            print(f"✅ Connected to main.hosts.daniil10295.ru")
-            print(f"📍 Your vIP: {int_to_ip(client.vip_int)}")
-            print("\n💬 Type messages to send to server, Ctrl+C to exit\n")
+    """Simple interactive version"""
+    with Client(host="127.0.0.1", vip="7.10.0.1") as client:
+        print("Connected to main.hosts.daniil10295.ru")
+        print(f"Your vIP: {int_to_ip(client.vip_int)}")
+        print("\nType messages to send to server, Ctrl+C to exit\n")
 
-            def receive_messages():
-                while True:
-                    try:
-                        pkt = client.receive()
-                        if pkt and pkt.type == S2C:
-                            print(f"\n📨 From {int_to_ip(pkt.src_ip)}: {pkt.payload.decode()}")
-                        elif pkt and pkt.type == MSG:
-                            print(f"\n📨 Server: {pkt.payload.decode()}")
-                    except:
-                        break
-
-            # Запускаем прием сообщений в отдельном потоке
-            import threading
-            receiver = threading.Thread(target=receive_messages)
-            receiver.daemon = True
-            receiver.start()
-            print("HELLO")
-            # Основной цикл ввода
+        def receive_messages():
             while True:
                 try:
-                    message = input("> ").strip()
-                    if message:
-                        if message.startswith('/'):
-                            if message == '/exit':
-                                break
-                            elif message == '/help':
-                                print("Commands: /exit, /help")
-                            else:
-                                print("Unknown command")
-                        else:
-                            client.send(Packet(MSG, message.encode()))
-                            print(f"📤 Sent: {message}")
-                except KeyboardInterrupt:
+                    pkt = client.receive()
+                    if pkt and pkt.type == S2C:
+                        print(f"\nFrom {int_to_ip(pkt.src_ip)}: {pkt.payload.decode()}")
+                    elif pkt and pkt.type == MSG:
+                        print(f"\nServer: {pkt.payload.decode()}")
+                except:
                     break
-                except Exception as e:
-                    print(f"Error: {e}")
 
-    # except Exception as e:
-    #     print(f"❌ Connection error: {e}")
+        import threading
+        receiver = threading.Thread(target=receive_messages)
+        receiver.daemon = True
+        receiver.start()
+        print("HELLO")
+        while True:
+            try:
+                message = input("> ").strip()
+                if message:
+                    if message.startswith('/'):
+                        if message == '/exit':
+                            break
+                        elif message == '/help':
+                            print("Commands: /exit, /help")
+                        else:
+                            print("Unknown command")
+                    else:
+                        client.send(Packet(MSG, message.encode()))
+                        print(f"Sent: {message}")
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                print(f"Error: {e}")
 
 
 # Использование

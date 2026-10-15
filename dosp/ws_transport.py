@@ -148,6 +148,10 @@ class WebSocketTransport:
         except Exception:
             pass
 
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
     def getpeername(self):
         try:
             return self._sock.getpeername()
